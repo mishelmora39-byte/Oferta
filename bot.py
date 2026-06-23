@@ -31,7 +31,7 @@ ADMIN_ID       = 333569583  # Solo Edwing puede mandar links
 
 CHAT_IDS_FILE  = "chat_ids.json"
 SEEN_DEALS_FILE = "seen_deals.json"
-MIN_DISCOUNT   = 40
+MIN_DISCOUNT   = 10
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
@@ -273,7 +273,8 @@ async def cmd_buscar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Uso: /buscar laptop — busca un producto específico")
         return
     await update.message.reply_text(f"🔍 Buscando: *{q}*...", parse_mode="Markdown")
-    deals = await search_api(q)
+    # Para búsqueda manual bajar el umbral a 20% para encontrar más
+    deals = await search_api(q, min_discount=20)
     n = await send_deals(ctx.bot, deals, update.effective_chat.id, limit=5)
     if n == 0:
         await update.message.reply_text("😔 Sin resultados con ese criterio.")
@@ -412,3 +413,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
