@@ -25,6 +25,8 @@ CUPONES = {
     "MESES SIN TARJETA": "",
 }
 
+CHANNEL_ID     = int(os.getenv("CHANNEL_ID", "-1004405739696"))  # @ofertasmx3
+
 CHAT_IDS_FILE  = "chat_ids.json"
 SEEN_DEALS_FILE = "seen_deals.json"
 MIN_DISCOUNT   = 40
@@ -216,10 +218,11 @@ async def send_deals(bot: Bot, deals: list, chat_id: int, limit: int = 5) -> int
     return sent
 
 async def broadcast(bot: Bot):
-    chat_ids = load_json(CHAT_IDS_FILE, [])
-    if not chat_ids:
-        return
     deals = await get_all_deals()
+    # Publicar en el canal público
+    await send_deals(bot, deals, CHANNEL_ID, limit=10)
+    # También notificar a suscriptores individuales
+    chat_ids = load_json(CHAT_IDS_FILE, [])
     for cid in chat_ids:
         await send_deals(bot, deals, cid)
 
