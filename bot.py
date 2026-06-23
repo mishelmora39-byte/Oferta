@@ -309,13 +309,19 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     deal = None
     try:
         if "mercadolibre" in text or "meli.la" in text:
-            # Extraer ID del producto del URL
-            async with httpx.AsyncClient(timeout=15, headers=HEADERS, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=20, headers=HEADERS, follow_redirects=True) as client:
+                # Expandir shortlink si es meli.la
                 r = await client.get(text)
                 final_url = str(r.url)
-                # Buscar MLA/MLM seguido de números
-                import re
+                logger.info(f"URL final: {final_url}")
+
+                # Buscar ID de producto MLM
                 match = re.search(r'MLM-?(\d+)', final_url, re.IGNORECASE)
+                
+                # Si no encontró en URL, buscar en el HTML
+                if not match:
+                    match = re.search(r'MLM-?(\d+)', r.text, re.IGNORECASE)
+
                 if match:
                     item_id = f"MLM{match.group(1)}"
                     api_r = await client.get(f"https://api.mercadolibre.com/items/{item_id}")
@@ -324,15 +330,24 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     original = item.get("original_price") or price
                     discount = round((1 - price / original) * 100) if original > price else 0
                     thumb = item.get("thumbnail", "").replace("-I.jpg", "").replace("http://", "https://")
+                    attrs = {a["id"]: a.get("value_name","") for a in item.get("attributes",[])}
                     deal = {
-                        "id": item_id,
-                        "title": item.get("title", "")[:70],
-                        "price": price,
-                        "original": original,
-                        "discount": discount,
-                        "url": make_affiliate_link(item.get("permalink", text)),
-                        "img": thumb,
+                        "id":           item_id,
+                        "title":        item.get("title", "")[:70],
+                        "price":        price,
+                        "original":     original,
+                        "discount":     discount,
+                        "url":          make_affiliate_link(item.get("permalink", text)),
+                        "img":          thumb,
+                        "condition":    item.get("condition",""),
+                        "sold_quantity": item.get("sold_quantity", 0),
+                        "brand":        attrs.get("BRAND",""),
+                        "model":        attrs.get("MODEL",""),
+                        "ram":          attrs.get("RAM",""),
+                        "storage":      attrs.get("STORAGE_CAPACITY",""),
                     }
+                else:
+                    logger.error(f"No se encontró ID MLM en: {final_url}")
     except Exception as e:
         logger.error(f"Error procesando link: {e}")
 
@@ -360,6 +375,13 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error publicando: {e}")
 
+async def cmd_limpiar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Solo admin puede limpiar el historial de ofertas vistas"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    save_json(SEEN_DEALS_FILE, [])
+    await update.message.reply_text("🗑️ Historial limpiado. La próxima búsqueda mostrará todas las ofertas.")
+
 async def cmd_salir(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     ids = load_json(CHAT_IDS_FILE, [])
@@ -375,7 +397,8 @@ def main():
     app.add_handler(CommandHandler("ofertas", cmd_ofertas))
     app.add_handler(CommandHandler("buscar",  cmd_buscar))
     app.add_handler(CommandHandler("estado",  cmd_estado))
-    app.add_handler(CommandHandler("salir",   cmd_salir))
+    app.add_handler(CommandHandler("salir",    cmd_salir))
+    app.add_handler(CommandHandler("limpiar",  cmd_limpiar))
     # Handler para links enviados por el admin
     from telegram.ext import MessageHandler, filters
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"https?://"), handle_link))
