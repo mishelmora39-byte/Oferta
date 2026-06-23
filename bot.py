@@ -1,4 +1,5 @@
 import json
+import re
 import os
 import logging
 import httpx
@@ -26,6 +27,7 @@ CUPONES = {
 }
 
 CHANNEL_ID     = int(os.getenv("CHANNEL_ID", "-1004405739696"))  # @ofertasmx3
+ADMIN_ID       = 333569583  # Solo Edwing puede mandar links
 
 CHAT_IDS_FILE  = "chat_ids.json"
 SEEN_DEALS_FILE = "seen_deals.json"
@@ -168,25 +170,40 @@ async def search_api(keyword: str) -> list:
                 # Imagen
                 thumb = item.get("thumbnail","")
                 img   = thumb.replace("-I.jpg","").replace("-O.jpg","").replace("http://","https://")
+                # Extraer atributos técnicos
+                attrs = {a["id"]: a.get("value_name","") for a in item.get("attributes",[])}
                 deals.append({
-                    "id":       item["id"],
-                    "title":    item["title"][:70],
-                    "price":    price,
-                    "original": original,
-                    "discount": discount,
-                    "url":      make_affiliate_link(item["permalink"]),
-                    "img":      img,
+                    "id":           item["id"],
+                    "title":        item["title"][:70],
+                    "price":        price,
+                    "original":     original,
+                    "discount":     discount,
+                    "url":          make_affiliate_link(item["permalink"]),
+                    "img":          img,
+                    "condition":    item.get("condition",""),
+                    "sold_quantity": item.get("sold_quantity", 0),
+                    "brand":        attrs.get("BRAND",""),
+                    "model":        attrs.get("MODEL",""),
+                    "ram":          attrs.get("RAM",""),
+                    "storage":      attrs.get("STORAGE_CAPACITY",""),
                 })
     except Exception as e:
         logger.error(f"API error [{keyword}]: {e}")
     return deals
 
 async def get_all_deals() -> list:
-    deals = await scrape_ofertas()
-    # Respaldo con API para palabras clave tech
-    for kw in ["laptop reacondicionado", "tablet outlet", "smartphone liquidacion"]:
+    deals = []
+    # Usar API de ML como fuente principal — precios confiables
+    keywords = [
+        "laptop reacondicionado", "tablet oferta", "smartphone descuento",
+        "audifonos bluetooth", "smartwatch barato", "consola videojuegos",
+        "ssd disco duro", "monitor pc", "bocina portatil", "camara seguridad"
+    ]
+    for kw in keywords:
         deals += await search_api(kw)
-    return list({d["id"]: d for d in deals}.values())
+    # Scraping como complemento
+    deals += await scrape_ofertas()
+    return list({d["id"]: d for d in deals if d["price"] > 0}.values())
 
 # ── Envío de mensajes ──────────────────────────────────────────────────────────
 async def send_deals(bot: Bot, deals: list, chat_id: int, limit: int = 5) -> int:
@@ -274,6 +291,75 @@ async def cmd_estado(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin manda un link de ML/Amazon → bot lo procesa y publica en el canal"""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("⛔ Solo el admin puede usar esta función.")
+        return
+
+    text = update.message.text.strip()
+    if not any(d in text for d in ["mercadolibre", "meli.la", "amazon.com"]):
+        await update.message.reply_text("⚠️ Manda un link de Mercado Libre o Amazon.")
+        return
+
+    await update.message.reply_text("🔍 Procesando link...")
+
+    # Obtener info del producto vía API de ML
+    deal = None
+    try:
+        if "mercadolibre" in text or "meli.la" in text:
+            # Extraer ID del producto del URL
+            async with httpx.AsyncClient(timeout=15, headers=HEADERS, follow_redirects=True) as client:
+                r = await client.get(text)
+                final_url = str(r.url)
+                # Buscar MLA/MLM seguido de números
+                import re
+                match = re.search(r'MLM-?(\d+)', final_url, re.IGNORECASE)
+                if match:
+                    item_id = f"MLM{match.group(1)}"
+                    api_r = await client.get(f"https://api.mercadolibre.com/items/{item_id}")
+                    item = api_r.json()
+                    price = item.get("price", 0)
+                    original = item.get("original_price") or price
+                    discount = round((1 - price / original) * 100) if original > price else 0
+                    thumb = item.get("thumbnail", "").replace("-I.jpg", "").replace("http://", "https://")
+                    deal = {
+                        "id": item_id,
+                        "title": item.get("title", "")[:70],
+                        "price": price,
+                        "original": original,
+                        "discount": discount,
+                        "url": make_affiliate_link(item.get("permalink", text)),
+                        "img": thumb,
+                    }
+    except Exception as e:
+        logger.error(f"Error procesando link: {e}")
+
+    if not deal or deal["price"] == 0:
+        await update.message.reply_text("❌ No pude obtener info del producto. Verifica el link.")
+        return
+
+    # Publicar en el canal
+    text_msg = format_deal(deal)
+    try:
+        if deal.get("img"):
+            await ctx.bot.send_photo(
+                chat_id=CHANNEL_ID,
+                photo=deal["img"],
+                caption=text_msg,
+                parse_mode="Markdown"
+            )
+        else:
+            await ctx.bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=text_msg,
+                parse_mode="Markdown"
+            )
+        await update.message.reply_text("✅ Publicado en el canal.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error publicando: {e}")
+
 async def cmd_salir(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     ids = load_json(CHAT_IDS_FILE, [])
@@ -290,9 +376,12 @@ def main():
     app.add_handler(CommandHandler("buscar",  cmd_buscar))
     app.add_handler(CommandHandler("estado",  cmd_estado))
     app.add_handler(CommandHandler("salir",   cmd_salir))
+    # Handler para links enviados por el admin
+    from telegram.ext import MessageHandler, filters
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"https?://"), handle_link))
 
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(broadcast, "interval", hours=3, args=[app.bot])
+    scheduler.add_job(broadcast, "interval", minutes=10, args=[app.bot])
     scheduler.start()
 
     logger.info("🤖 JackRocko Bot iniciado con scraping de ofertas")
