@@ -1,11 +1,12 @@
 import json
 import re
 import os
+import time
 import logging
 import httpx
 from bs4 import BeautifulSoup
-from telegram import Bot, Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Bot, Update, InputMediaPhoto
+from telegram.ext import Application, CommandHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logging.basicConfig(level=logging.INFO)
@@ -14,177 +15,213 @@ logger = logging.getLogger(__name__)
 # ── Config ─────────────────────────────────────────────────────────────────────
 BOT_TOKEN    = os.getenv("BOT_TOKEN", "TU_TOKEN_AQUI")
 AFFILIATE_ID = os.getenv("AFFILIATE_ID", "293AH0-18PY")
-ML_CLIENT_ID     = os.getenv("ML_CLIENT_ID", "127137755266066")
-ML_CLIENT_SECRET = os.getenv("ML_CLIENT_SECRET", "RDWxlk7I8jlWyQ39yu2Sd8L0AJPZXEty")
 
+# ── Credenciales OAuth de Mercado Libre ────────────────────────────────────────
+ML_CLIENT_ID     = os.getenv("ML_CLIENT_ID", "")
+ML_CLIENT_SECRET = os.getenv("ML_CLIENT_SECRET", "")
+ML_ACCESS_TOKEN  = os.getenv("ML_ACCESS_TOKEN", "")
+ML_REFRESH_TOKEN = os.getenv("ML_REFRESH_TOKEN", "")
+
+# Archivo para persistir tokens renovados
+ML_TOKENS_FILE = "ml_tokens.json"
+
+# Token en memoria (se carga al iniciar, se renueva automáticamente)
+_ml_token_data = {
+    "access_token": "",
+    "refresh_token": "",
+    "expires_at": 0,  # timestamp unix cuando expira
+}
+
+# Cupones bancarios opcionales — déjalos vacíos ("") si no hay vigentes
 CUPONES = {
-    "BBVA":              "",
-    "BANAMEX":           "",
-    "AMEX":              "",
-    "AFIRME":            "",
-    "MIFEL":             "",
-    "MERCADO PAGO":      "",
+    "BBVA":            "",
+    "BANAMEX":         "",
+    "AMEX":            "",
+    "AFIRME":          "",
+    "MIFEL":           "",
+    "MERCADO PAGO":    "",
     "MESES SIN TARJETA": "",
 }
 
-CHANNEL_ID      = int(os.getenv("CHANNEL_ID", "-1004405739696"))
-ADMIN_ID        = 333569583
-CHAT_IDS_FILE   = "chat_ids.json"
+CHANNEL_ID     = int(os.getenv("CHANNEL_ID", "-1004405739696"))  # @ofertasmx3
+ADMIN_ID       = 333569583  # Solo Edwing puede mandar links
+
+CHAT_IDS_FILE  = "chat_ids.json"
 SEEN_DEALS_FILE = "seen_deals.json"
-MIN_DISCOUNT    = 10
+MIN_DISCOUNT   = 10
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
     "Accept-Language": "es-MX,es;q=0.9",
 }
 
-# Token de ML en memoria (se renueva automáticamente)
-_ml_token = {"value": "", "expires_at": 0}
+# ── Gestión de Tokens OAuth de Mercado Libre ───────────────────────────────────
 
-# ── Token ML Auto-Renovable ────────────────────────────────────────────────────
-async def get_ml_token() -> str:
-    """Obtiene o renueva el Access Token de Mercado Libre automáticamente."""
-    import time
-    if _ml_token["value"] and time.time() < _ml_token["expires_at"] - 300:
-        return _ml_token["value"]
+def _load_tokens():
+    """Carga tokens desde archivo persistente o variables de entorno."""
+    global _ml_token_data
+    # Intentar cargar tokens guardados en disco (renovados previamente)
+    try:
+        with open(ML_TOKENS_FILE) as f:
+            saved = json.load(f)
+            if saved.get("access_token"):
+                _ml_token_data = saved
+                logger.info("✅ Tokens OAuth cargados desde archivo persistente")
+                return
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+    # Si no hay archivo, usar variables de entorno (primer arranque)
+    if ML_ACCESS_TOKEN:
+        _ml_token_data["access_token"] = ML_ACCESS_TOKEN
+        _ml_token_data["refresh_token"] = ML_REFRESH_TOKEN
+        # Asumir que el token de env podría estar próximo a expirar;
+        # poner expires_at = ahora + 5 horas (ML da 6h, dejamos margen)
+        _ml_token_data["expires_at"] = time.time() + 5 * 3600
+        _save_tokens()
+        logger.info("✅ Tokens OAuth inicializados desde variables de entorno")
+    else:
+        logger.warning("⚠️ No hay ML_ACCESS_TOKEN configurado — las llamadas API irán sin autenticación")
+
+
+def _save_tokens():
+    """Persiste los tokens en disco para sobrevivir reinicios."""
+    try:
+        with open(ML_TOKENS_FILE, "w") as f:
+            json.dump(_ml_token_data, f)
+    except Exception as e:
+        logger.error(f"Error guardando tokens: {e}")
+
+
+def _token_is_expired() -> bool:
+    """Verifica si el access token ha expirado o está por expirar (margen 5 min)."""
+    if not _ml_token_data.get("access_token"):
+        return True
+    return time.time() >= (_ml_token_data.get("expires_at", 0) - 300)
+
+
+async def _refresh_access_token() -> bool:
+    """
+    Renueva el access token usando el refresh token.
+    Endpoint: https://api.mercadolibre.com/oauth/token
+    Grant type: refresh_token
+    Retorna True si se renovó correctamente, False si falló.
+    """
+    global _ml_token_data
+
+    refresh_token = _ml_token_data.get("refresh_token", "")
+    if not refresh_token:
+        logger.error("❌ No hay refresh_token disponible para renovar")
+        return False
 
     if not ML_CLIENT_ID or not ML_CLIENT_SECRET:
-        logger.warning("ML_CLIENT_ID o ML_CLIENT_SECRET no configurados.")
-        return ""
+        logger.error("❌ Faltan ML_CLIENT_ID o ML_CLIENT_SECRET para renovar token")
+        return False
+
+    payload = {
+        "grant_type": "refresh_token",
+        "client_id": ML_CLIENT_ID,
+        "client_secret": ML_CLIENT_SECRET,
+        "refresh_token": refresh_token,
+    }
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(
-                "https://api.mercadolibre.com/oauth/token",
-                headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
-                data={
-                    "grant_type":    "client_credentials",
-                    "client_id":     ML_CLIENT_ID,
-                    "client_secret": ML_CLIENT_SECRET,
-                }
-            )
+            r = await client.post("https://api.mercadolibre.com/oauth/token", data=payload)
             if r.status_code == 200:
                 data = r.json()
-                import time
-                _ml_token["value"]      = data["access_token"]
-                _ml_token["expires_at"] = time.time() + data.get("expires_in", 21600)
-                logger.info("✅ Token ML renovado correctamente.")
-                return _ml_token["value"]
+                _ml_token_data["access_token"] = data["access_token"]
+                _ml_token_data["refresh_token"] = data.get("refresh_token", refresh_token)
+                # ML devuelve expires_in en segundos (normalmente 21600 = 6 horas)
+                expires_in = data.get("expires_in", 21600)
+                _ml_token_data["expires_at"] = time.time() + expires_in
+                _save_tokens()
+                logger.info(f"🔄 Access token renovado exitosamente (expira en {expires_in//3600}h {(expires_in%3600)//60}m)")
+                return True
             else:
-                logger.error(f"Error obteniendo token ML: {r.status_code} {r.text[:200]}")
+                logger.error(f"❌ Error renovando token: {r.status_code} — {r.text}")
+                return False
     except Exception as e:
-        logger.error(f"Excepción obteniendo token ML: {e}")
-    return ""
+        logger.error(f"❌ Excepción renovando token: {e}")
+        return False
 
-async def ml_headers() -> dict:
-    """Devuelve headers con Authorization si hay token disponible."""
-    token = await get_ml_token()
-    h = dict(HEADERS)
+
+async def get_ml_access_token() -> str:
+    """
+    Devuelve un access token válido.
+    Si está expirado, intenta renovarlo automáticamente.
+    Si no hay token, devuelve cadena vacía (las llamadas irán sin auth).
+    """
+    if not _ml_token_data.get("access_token"):
+        return ""
+
+    if _token_is_expired():
+        logger.info("⏰ Token expirado, intentando renovar...")
+        success = await _refresh_access_token()
+        if not success:
+            logger.warning("⚠️ No se pudo renovar el token, usando el actual (podría fallar)")
+
+    return _ml_token_data.get("access_token", "")
+
+
+def _ml_auth_headers(token: str) -> dict:
+    """Genera headers con autenticación Bearer para la API de Mercado Libre."""
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
     if token:
-        h["Authorization"] = f"Bearer {token}"
-    return h
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def load_json(path, default):
     try:
         with open(path) as f:
             return json.load(f)
-    except Exception as e:
-        logger.debug(f"load_json {path}: {e}")
+    except:
         return default
 
 def save_json(path, data):
-    try:
-        with open(path, "w") as f:
-            json.dump(data, f)
-    except Exception as e:
-        logger.error(f"save_json {path}: {e}")
+    with open(path, "w") as f:
+        json.dump(data, f)
 
 def make_affiliate_link(url: str) -> str:
-    clean = url.split("#")[0]
-    sep = "&" if "?" in clean else "?"
-    return f"{clean}{sep}matt_tool={AFFILIATE_ID}&matt_source=telegram&matt_campaign=jackrocko"
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}matt_tool={AFFILIATE_ID}&matt_word=&matt_source=telegram&matt_campaign=jackrocko"
 
 def cupones_text() -> str:
-    activos = {b: c for b, c in CUPONES.items() if c.strip()}
+    activos = {banco: codigo for banco, codigo in CUPONES.items() if codigo.strip()}
     if not activos:
         return ""
-    lineas = "\n".join(f'🟡 {b}: *"{c}"*' for b, c in activos.items())
+    lineas = "\n".join(f'🟡 {banco}: *"{codigo}"*' for banco, codigo in activos.items())
     return f"\n\n💳 *Cupones bancarios:*\n{lineas}"
 
 def format_deal(deal: dict) -> str:
-    cupones   = cupones_text()
-    original  = deal.get("original", 0)
-    price     = deal.get("price", 0)
-    discount  = deal.get("discount", 0)
+    """
+    Formato del mensaje de oferta:
+    ~precio_original~ → precio_final (con el descuento%)
 
-    # Precio final = precio de oferta (ya con descuento aplicado)
-    final_price = price
+    CÁLCULO DE PRECIO FINAL:
+    precio_final = precio_original × (1 - descuento/100)
 
-    # Línea de precio: tachado → precio final
-    if original > price:
-        price_line = f"~~${original:,.0f}~~ → 💵 *${final_price:,.0f} MXN*"
-    else:
-        price_line = f"💵 *${final_price:,.0f} MXN*"
+    La API de Mercado Libre ya devuelve 'price' como el precio con descuento
+    y 'original_price' como el precio original, así que:
+      - deal['original'] = precio_original (sin descuento)
+      - deal['price']    = precio_final (ya con descuento aplicado)
+      - deal['discount'] = porcentaje de descuento
 
-    disc_str = f"\n🏷️ *{discount}% OFF*" if discount >= MIN_DISCOUNT else ""
-
+    Verificación: precio_final ≈ precio_original × (1 - descuento/100)
+    """
+    cupones = cupones_text()
     return (
         f"🔥 *{deal['title']}*\n\n"
-        f"💰 Precio final: {price_line}"
-        f"{disc_str}"
+        f"💰 ~${deal['original']:,.0f}~ → *${deal['price']:,.0f} MXN*\n"
+        f"🏷️ *{deal['discount']}% OFF*"
         f"{cupones}\n\n"
         f"🛒 [Ver oferta en Mercado Libre]({deal['url']})"
     )
-
-# ── Extracción de precio segura (anti-cuotas) ──────────────────────────────────
-def extract_price_safe(text: str) -> float:
-    """
-    Extrae el precio real de un texto de tarjeta de ML.
-    Ignora cuotas (meses sin intereses) y precios absurdamente bajos.
-    """
-    # Buscar todos los números con formato de precio ($1,234 o $1234)
-    raw_prices = re.findall(r'\$\s?([\d]{1,3}(?:,[\d]{3})*(?:\.[\d]{1,2})?)', text)
-    if not raw_prices:
-        # Intentar sin símbolo de peso
-        raw_prices = re.findall(r'\b([\d]{3,7})\b', text)
-
-    prices = []
-    for p in raw_prices:
-        try:
-            val = float(p.replace(",", ""))
-            # Ignorar valores que parecen cuotas (< 200 pesos) o irreales (> 500,000)
-            if 200 <= val <= 500000:
-                prices.append(val)
-        except:
-            pass
-
-    if not prices:
-        return 0.0
-
-    # Si hay texto de "meses" o "cuotas", el precio real es el MAYOR encontrado
-    if any(w in text.lower() for w in ["meses", "cuotas", "sin interés", "mensual"]):
-        return max(prices)
-
-    # En general, el precio de oferta es el primero grande que encontramos
-    return prices[0]
-
-def extract_discount_safe(text: str, price: float, original: float) -> int:
-    """Extrae el descuento real. Si parece absurdo (>90%), lo recalcula o descarta."""
-    # Buscar % en el texto
-    match = re.search(r'(\d{1,2})\s*%\s*(?:OFF|off|descuento)', text)
-    if match:
-        disc = int(match.group(1))
-        if disc <= 90:
-            return disc
-
-    # Calcular desde precios
-    if original > 0 and price > 0 and original > price:
-        disc = round((1 - price / original) * 100)
-        if disc <= 90:
-            return disc
-
-    return 0
 
 # ── Scraping de mercadolibre.com.mx/ofertas ────────────────────────────────────
 async def scrape_ofertas() -> list:
@@ -200,83 +237,55 @@ async def scrape_ofertas() -> list:
                 soup = BeautifulSoup(r.text, "html.parser")
                 items = soup.select("li.promotion-item, div.andes-card, article[class*='item']")
                 logger.info(f"Scraping {url}: {len(items)} items encontrados")
-
                 for item in items:
                     try:
                         # Título
-                        title_el = item.select_one(
-                            "p.promotion-item__title, h2, [class*='title'], a[title]"
-                        )
+                        title_el = item.select_one("p.promotion-item__title, h2, [class*='title']")
                         title = title_el.get_text(strip=True) if title_el else None
-                        if not title or len(title) < 5:
+                        if not title:
                             continue
 
-                        full_text = item.get_text(" ", strip=True)
+                        # Precios
+                        price_el    = item.select_one("[class*='price__fraction'], [class*='current']")
+                        original_el = item.select_one("[class*='original'], s, del, [class*='crossed']")
+                        discount_el = item.select_one("[class*='discount'], [class*='off'], [class*='pill']")
 
-                        # Precio actual (seguro, anti-cuotas)
-                        price_el = item.select_one(
-                            ".andes-money-amount__fraction, [class*='price__fraction'], [class*='current-price']"
-                        )
-                        if price_el:
-                            price_text = price_el.get_text(strip=True).replace(",", "").replace("$", "")
-                            try:
-                                price = float(price_text)
-                            except:
-                                price = extract_price_safe(full_text)
-                        else:
-                            price = extract_price_safe(full_text)
+                        price_text    = price_el.get_text(strip=True).replace(",","").replace("$","") if price_el else ""
+                        original_text = original_el.get_text(strip=True).replace(",","").replace("$","") if original_el else ""
+                        discount_text = discount_el.get_text(strip=True).replace("%","").replace("-","").replace("OFF","").strip() if discount_el else ""
 
-                        # Precio original (tachado)
-                        original_el = item.select_one(
-                            "s .andes-money-amount__fraction, del .andes-money-amount__fraction, "
-                            "[class*='original'] .andes-money-amount__fraction, [class*='crossed']"
-                        )
-                        if original_el:
-                            orig_text = original_el.get_text(strip=True).replace(",", "").replace("$", "")
-                            try:
-                                original = float(orig_text)
-                            except:
-                                original = 0
-                        else:
-                            original = 0
+                        price    = float(price_text)    if price_text.replace(".","").isdigit()    else 0
+                        original = float(original_text) if original_text.replace(".","").isdigit() else 0
+                        discount = int(discount_text)   if discount_text.isdigit()                 else 0
 
-                        # Descuento seguro
-                        discount = extract_discount_safe(full_text, price, original)
+                        # Calcular descuento si no viene explícito
+                        if discount == 0 and price > 0 and original > price:
+                            discount = round((1 - price / original) * 100)
 
-                        # Validaciones de seguridad
-                        if price <= 0:
-                            continue
                         if discount < MIN_DISCOUNT:
-                            continue
-                        # Si el descuento parece absurdo (precio < 5% del original), descartar
-                        if original > 0 and price < (original * 0.05):
-                            logger.debug(f"Descuento absurdo descartado: {title[:40]} ${price} vs ${original}")
                             continue
 
                         # Link
                         link_el = item.select_one("a[href]")
-                        link = link_el["href"] if link_el else ""
+                        link    = link_el["href"] if link_el else ""
                         if not link or "mercadolibre" not in link:
                             continue
 
                         # Imagen
                         img_el = item.select_one("img")
-                        img = ""
-                        if img_el:
-                            img = img_el.get("data-src") or img_el.get("src", "")
-                            img = img.replace("-I.jpg", "").replace("-O.jpg", "")
-                            if not img.startswith("http"):
-                                img = ""
+                        img    = img_el.get("data-src") or img_el.get("src","") if img_el else ""
+                        img = img.replace("-I.jpg","").replace("-O.jpg","")
+                        if img and not img.startswith("http"):
+                            img = ""
 
-                        # ID único
-                        prod_id = re.search(r'MLM-?(\d+)', link)
-                        prod_id = f"MLM{prod_id.group(1)}" if prod_id else link.split("?")[0][-20:]
+                        # ID único del producto
+                        prod_id = link.split("/p/")[-1].split("?")[0] if "/p/" in link else link.split("-")[-1].split("?")[0]
 
                         deals.append({
                             "id":       prod_id,
                             "title":    title[:70],
                             "price":    price,
-                            "original": original if original > price else price,
+                            "original": original if original > 0 else price,
                             "discount": discount,
                             "url":      make_affiliate_link(link),
                             "img":      img,
@@ -291,48 +300,117 @@ async def scrape_ofertas() -> list:
     logger.info(f"Total ofertas scrapeadas: {len(unique)}")
     return unique
 
-# ── Búsqueda via API de ML ─────────────────────────────────────────────────────
+# ── Búsqueda vía API de ML con autenticación OAuth ────────────────────────────
 async def search_api(keyword: str, min_discount: int = MIN_DISCOUNT) -> list:
+    """
+    Busca productos en la API de Mercado Libre usando autenticación OAuth.
+    Con el access token, se evitan errores 403 Forbidden.
+    """
     deals = []
     try:
-        headers = await ml_headers()
-        async with httpx.AsyncClient(timeout=15, headers=headers) as client:
+        token = await get_ml_access_token()
+        auth_headers = _ml_auth_headers(token)
+
+        async with httpx.AsyncClient(timeout=15) as client:
             r = await client.get(
                 "https://api.mercadolibre.com/sites/MLM/search",
-                params={"q": keyword, "limit": 30}
+                params={"q": keyword, "limit": 30},
+                headers=auth_headers,
             )
+
+            if r.status_code == 401 and token:
+                # Token inválido — intentar renovar y reintentar
+                logger.warning("⚠️ Token rechazado (401), renovando...")
+                if await _refresh_access_token():
+                    token = _ml_token_data["access_token"]
+                    auth_headers = _ml_auth_headers(token)
+                    r = await client.get(
+                        "https://api.mercadolibre.com/sites/MLM/search",
+                        params={"q": keyword, "limit": 30},
+                        headers=auth_headers,
+                    )
+
             if r.status_code == 403:
-                logger.warning(f"API ML 403 para '{keyword}' — sin token válido.")
-                return []
+                logger.error(f"❌ 403 Forbidden en búsqueda '{keyword}' — verificar permisos OAuth")
+                return deals
+
+            if r.status_code != 200:
+                logger.error(f"❌ API respondió {r.status_code} para '{keyword}'")
+                return deals
+
             for item in r.json().get("results", []):
                 price    = item.get("price", 0)
                 original = item.get("original_price", 0)
                 if not original or original <= price:
                     continue
+
+                # Cálculo de descuento: discount = (1 - precio_final/precio_original) × 100
+                # Verificación inversa: precio_final = precio_original × (1 - discount/100)
                 discount = round((1 - price / original) * 100)
                 if discount < min_discount:
                     continue
-                thumb = item.get("thumbnail", "").replace("-I.jpg", "").replace("http://", "https://")
-                attrs = {a["id"]: a.get("value_name", "") for a in item.get("attributes", [])}
+
+                # Imagen
+                thumb = item.get("thumbnail","")
+                img   = thumb.replace("-I.jpg","").replace("-O.jpg","").replace("http://","https://")
+                # Atributos técnicos
+                attrs = {a["id"]: a.get("value_name","") for a in item.get("attributes",[])}
                 deals.append({
                     "id":           item["id"],
                     "title":        item["title"][:70],
-                    "price":        price,
-                    "original":     original,
-                    "discount":     discount,
+                    "price":        price,         # precio_final (con descuento)
+                    "original":     original,      # precio_original (sin descuento)
+                    "discount":     discount,      # porcentaje OFF
                     "url":          make_affiliate_link(item["permalink"]),
-                    "img":          thumb,
-                    "condition":    item.get("condition", ""),
+                    "img":          img,
+                    "condition":    item.get("condition",""),
                     "sold_quantity": item.get("sold_quantity", 0),
-                    "brand":        attrs.get("BRAND", ""),
-                    "model":        attrs.get("MODEL", ""),
+                    "brand":        attrs.get("BRAND",""),
+                    "model":        attrs.get("MODEL",""),
+                    "ram":          attrs.get("RAM",""),
+                    "storage":      attrs.get("STORAGE_CAPACITY",""),
                 })
     except Exception as e:
         logger.error(f"API error [{keyword}]: {e}")
     return deals
 
+# ── Consulta de un item específico con autenticación ──────────────────────────
+async def get_item_by_id(item_id: str) -> dict | None:
+    """
+    Obtiene información de un producto por su ID (ej: MLM123456)
+    usando autenticación OAuth para evitar 403.
+    """
+    try:
+        token = await get_ml_access_token()
+        auth_headers = _ml_auth_headers(token)
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                f"https://api.mercadolibre.com/items/{item_id}",
+                headers=auth_headers,
+            )
+
+            if r.status_code == 401 and token:
+                logger.warning("⚠️ Token rechazado (401) en get_item, renovando...")
+                if await _refresh_access_token():
+                    auth_headers = _ml_auth_headers(_ml_token_data["access_token"])
+                    r = await client.get(
+                        f"https://api.mercadolibre.com/items/{item_id}",
+                        headers=auth_headers,
+                    )
+
+            if r.status_code != 200:
+                logger.error(f"❌ Error obteniendo item {item_id}: {r.status_code}")
+                return None
+
+            return r.json()
+    except Exception as e:
+        logger.error(f"Error get_item {item_id}: {e}")
+        return None
+
 async def get_all_deals() -> list:
     deals = []
+    # Usar API de ML con autenticación como fuente principal
     keywords = [
         "laptop reacondicionado", "tablet oferta", "smartphone descuento",
         "audifonos bluetooth", "smartwatch barato", "consola videojuegos",
@@ -344,133 +422,11 @@ async def get_all_deals() -> list:
     deals += await scrape_ofertas()
     return list({d["id"]: d for d in deals if d["price"] > 0}.values())
 
-# ── Obtener info de producto por ID MLM ───────────────────────────────────────
-async def get_item_by_id(item_id: str) -> dict | None:
-    """Consulta la API de ML para obtener info de un producto por su ID."""
-    try:
-        headers = await ml_headers()
-        async with httpx.AsyncClient(timeout=20, headers=headers, follow_redirects=True) as client:
-            r = await client.get(f"https://api.mercadolibre.com/items/{item_id}")
-            if r.status_code != 200:
-                logger.error(f"API items/{item_id}: {r.status_code} {r.text[:150]}")
-                return None
-            item = r.json()
-            price    = item.get("price", 0)
-            original = item.get("original_price") or price
-            discount = round((1 - price / original) * 100) if original > price else 0
-            thumb    = item.get("thumbnail", "").replace("-I.jpg", "").replace("http://", "https://")
-            attrs    = {a["id"]: a.get("value_name", "") for a in item.get("attributes", [])}
-            return {
-                "id":           item_id,
-                "title":        item.get("title", "")[:70],
-                "price":        price,
-                "original":     original,
-                "discount":     discount,
-                "url":          make_affiliate_link(item.get("permalink", "")),
-                "img":          thumb,
-                "condition":    item.get("condition", ""),
-                "sold_quantity": item.get("sold_quantity", 0),
-                "brand":        attrs.get("BRAND", ""),
-                "model":        attrs.get("MODEL", ""),
-            }
-    except Exception as e:
-        logger.error(f"get_item_by_id {item_id}: {e}")
-        return None
-
-# ── Scraping de producto individual (fallback sin API) ─────────────────────────
-async def scrape_product_page(url: str) -> dict | None:
-    """
-    Intenta extraer título, precio e imagen directamente del HTML del producto.
-    Fallback cuando la API no está disponible.
-    """
-    try:
-        async with httpx.AsyncClient(timeout=20, headers=HEADERS, follow_redirects=True) as client:
-            r = await client.get(url)
-            final_url = str(r.url)
-
-            # Si ML redirige a verificación, no podemos hacer nada sin sesión
-            if "account-verification" in final_url or "login" in final_url:
-                logger.warning("ML redirigió a verificación de cuenta — scraping bloqueado.")
-                return None
-
-            soup = BeautifulSoup(r.text, "html.parser")
-
-            # Intentar JSON-LD primero (más confiable)
-            for script in soup.find_all("script", type="application/ld+json"):
-                try:
-                    data = json.loads(script.string or "")
-                    if data.get("@type") == "Product":
-                        offers = data.get("offers", {})
-                        price  = float(offers.get("price", 0))
-                        name   = data.get("name", "")
-                        image  = data.get("image", "")
-                        if isinstance(image, list):
-                            image = image[0] if image else ""
-                        if price > 0 and name:
-                            item_id = re.search(r'MLM-?(\d+)', final_url)
-                            return {
-                                "id":       f"MLM{item_id.group(1)}" if item_id else final_url[-15:],
-                                "title":    name[:70],
-                                "price":    price,
-                                "original": price,
-                                "discount": 0,
-                                "url":      make_affiliate_link(final_url),
-                                "img":      image,
-                            }
-                except:
-                    pass
-
-            # Selectores directos del HTML
-            title_el    = soup.select_one("h1.ui-pdp-title, h1[class*='title']")
-            price_el    = soup.select_one(".andes-money-amount__fraction")
-            original_el = soup.select_one(
-                ".ui-pdp-price__original-value .andes-money-amount__fraction"
-            )
-            img_el = soup.select_one(
-                ".ui-pdp-gallery__figure img, figure img, [class*='gallery'] img"
-            )
-
-            title = title_el.get_text(strip=True) if title_el else None
-            if not title:
-                return None
-
-            full_text = soup.get_text(" ", strip=True)
-            price     = extract_price_safe(
-                price_el.get_text(strip=True) if price_el else full_text
-            )
-            original  = 0
-            if original_el:
-                try:
-                    original = float(original_el.get_text(strip=True).replace(",", "").replace("$", ""))
-                except:
-                    pass
-
-            discount = extract_discount_safe(full_text, price, original)
-            img = ""
-            if img_el:
-                img = img_el.get("data-zoom") or img_el.get("src", "")
-                if not img.startswith("http"):
-                    img = ""
-
-            item_id = re.search(r'MLM-?(\d+)', final_url)
-            return {
-                "id":       f"MLM{item_id.group(1)}" if item_id else final_url[-15:],
-                "title":    title[:70],
-                "price":    price,
-                "original": original if original > price else price,
-                "discount": discount,
-                "url":      make_affiliate_link(final_url),
-                "img":      img,
-            }
-    except Exception as e:
-        logger.error(f"scrape_product_page: {e}")
-        return None
-
 # ── Envío de mensajes ──────────────────────────────────────────────────────────
 async def send_deals(bot: Bot, deals: list, chat_id: int, limit: int = 5) -> int:
-    seen = load_json(SEEN_DEALS_FILE, [])
-    new  = [d for d in deals if d["id"] not in seen]
-    sent = 0
+    seen    = load_json(SEEN_DEALS_FILE, [])
+    new     = [d for d in deals if d["id"] not in seen]
+    sent    = 0
     for deal in new[:limit]:
         text = format_deal(deal)
         try:
@@ -510,8 +466,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ids.append(cid)
         save_json(CHAT_IDS_FILE, ids)
     await update.message.reply_text(
-        "🔥 *@JackRocko_bot activado*\n\n"
-        "Te mando ofertas de Mercado Libre con ≥10% descuento cada 3 horas.\n\n"
+        "🔥 *@JackRocko\\_bot activado*\n\n"
+        "Te mando ofertas de Mercado Libre con ≥40% descuento cada 3 horas.\n\n"
         "/ofertas — buscar ahora\n"
         "/buscar [producto] — buscar algo específico\n"
         "/estado — ver estadísticas\n"
@@ -532,7 +488,7 @@ async def cmd_buscar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Uso: /buscar laptop — busca un producto específico")
         return
     await update.message.reply_text(f"🔍 Buscando: *{q}*...", parse_mode="Markdown")
-    deals = await search_api(q, min_discount=10)
+    deals = await search_api(q, min_discount=20)
     n = await send_deals(ctx.bot, deals, update.effective_chat.id, limit=5)
     if n == 0:
         await update.message.reply_text("😔 Sin resultados con ese criterio.")
@@ -541,91 +497,91 @@ async def cmd_estado(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ids  = load_json(CHAT_IDS_FILE, [])
     seen = load_json(SEEN_DEALS_FILE, [])
     cupones_activos = sum(1 for v in CUPONES.values() if v.strip())
-    token_ok = "✅ Configurado" if ML_CLIENT_ID and ML_CLIENT_SECRET else "❌ Sin configurar"
+
+    # Estado del token OAuth
+    if _ml_token_data.get("access_token"):
+        remaining = _ml_token_data.get("expires_at", 0) - time.time()
+        if remaining > 0:
+            hours = int(remaining // 3600)
+            mins  = int((remaining % 3600) // 60)
+            token_status = f"✅ Activo (expira en {hours}h {mins}m)"
+        else:
+            token_status = "⚠️ Expirado (se renovará automáticamente)"
+    else:
+        token_status = "❌ No configurado"
+
     await update.message.reply_text(
         f"📊 *Estado de JackRocko Bot*\n\n"
         f"👥 Suscriptores: *{len(ids)}*\n"
         f"📦 Ofertas enviadas: *{len(seen)}*\n"
-        f"🔑 Token ML: {token_ok}\n"
         f"🔗 Links afiliado: ✅\n"
-        f"💳 Cupones activos: *{cupones_activos}*",
+        f"💳 Cupones activos: *{cupones_activos}*\n"
+        f"🔑 OAuth ML: {token_status}",
         parse_mode="Markdown"
     )
 
-async def cmd_limpiar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    save_json(SEEN_DEALS_FILE, [])
-    await update.message.reply_text("🗑️ Historial limpiado. La próxima búsqueda mostrará todas las ofertas.")
-
-async def cmd_salir(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    ids = load_json(CHAT_IDS_FILE, [])
-    if cid in ids:
-        ids.remove(cid)
-        save_json(CHAT_IDS_FILE, ids)
-    await update.message.reply_text("👋 Te diste de baja. Escribe /start para volver.")
-
-# ── Handler de links manuales (Admin) ─────────────────────────────────────────
 async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Admin manda un link de ML → bot lo procesa y publica en el canal."""
+    """Admin manda un link de ML/Amazon → bot lo procesa y publica en el canal"""
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
         await update.message.reply_text("⛔ Solo el admin puede usar esta función.")
         return
 
     text = update.message.text.strip()
-    if not any(d in text for d in ["mercadolibre", "meli.la"]):
-        await update.message.reply_text("⚠️ Manda un link de Mercado Libre.")
+    if not any(d in text for d in ["mercadolibre", "meli.la", "amazon.com"]):
+        await update.message.reply_text("⚠️ Manda un link de Mercado Libre o Amazon.")
         return
 
     await update.message.reply_text("🔍 Procesando link...")
 
     deal = None
-
     try:
-        async with httpx.AsyncClient(timeout=20, headers=HEADERS, follow_redirects=True) as client:
-            # Expandir shortlink si es meli.la
-            r = await client.get(text)
-            final_url = str(r.url)
-            logger.info(f"URL final: {final_url}")
+        if "mercadolibre" in text or "meli.la" in text:
+            async with httpx.AsyncClient(timeout=20, headers=HEADERS, follow_redirects=True) as client:
+                r = await client.get(text)
+                final_url = str(r.url)
+                logger.info(f"URL final: {final_url}")
 
-            # Buscar ID MLM en la URL o en los parámetros
-            # Buscar en item_id=MLM... (parámetro de URL)
-            match = re.search(r'item_id[=%3A:]+MLM-?(\d+)', final_url, re.IGNORECASE)
-            if not match:
-                match = re.search(r'wid=MLM-?(\d+)', final_url, re.IGNORECASE)
-            if not match:
                 match = re.search(r'MLM-?(\d+)', final_url, re.IGNORECASE)
-            if not match:
-                # Buscar en el HTML de la página
-                match = re.search(r'MLM-?(\d+)', r.text, re.IGNORECASE)
+                if not match:
+                    match = re.search(r'MLM-?(\d+)', r.text, re.IGNORECASE)
 
-            if match:
-                item_id = f"MLM{match.group(1)}"
-                logger.info(f"ID encontrado: {item_id}")
-                # Intentar via API primero
-                deal = await get_item_by_id(item_id)
-
-            # Si la API falló, intentar scraping del HTML
-            if not deal:
-                logger.info("API falló, intentando scraping del HTML...")
-                deal = await scrape_product_page(final_url)
-
+                if match:
+                    item_id = f"MLM{match.group(1)}"
+                    # Usar función autenticada para obtener el item
+                    item = await get_item_by_id(item_id)
+                    if item:
+                        price = item.get("price", 0)
+                        original = item.get("original_price") or price
+                        # Cálculo: discount = (1 - price/original) × 100
+                        # Inverso: price = original × (1 - discount/100) ✓
+                        discount = round((1 - price / original) * 100) if original > price else 0
+                        thumb = item.get("thumbnail", "").replace("-I.jpg", "").replace("http://", "https://")
+                        attrs = {a["id"]: a.get("value_name","") for a in item.get("attributes",[])}
+                        deal = {
+                            "id":           item_id,
+                            "title":        item.get("title", "")[:70],
+                            "price":        price,
+                            "original":     original,
+                            "discount":     discount,
+                            "url":          make_affiliate_link(item.get("permalink", text)),
+                            "img":          thumb,
+                            "condition":    item.get("condition",""),
+                            "sold_quantity": item.get("sold_quantity", 0),
+                            "brand":        attrs.get("BRAND",""),
+                            "model":        attrs.get("MODEL",""),
+                            "ram":          attrs.get("RAM",""),
+                            "storage":      attrs.get("STORAGE_CAPACITY",""),
+                        }
+                else:
+                    logger.error(f"No se encontró ID MLM en: {final_url}")
     except Exception as e:
         logger.error(f"Error procesando link: {e}")
 
-    if not deal or deal.get("price", 0) == 0:
-        await update.message.reply_text(
-            "❌ No pude obtener info del producto.\n\n"
-            "Posibles causas:\n"
-            "• Mercado Libre bloqueó el acceso sin sesión\n"
-            "• El link es de catálogo y no de un producto directo\n\n"
-            "Intenta con un link directo al producto (que tenga MLM en la URL)."
-        )
+    if not deal or deal["price"] == 0:
+        await update.message.reply_text("❌ No pude obtener info del producto. Verifica el link.")
         return
 
-    # Publicar en el canal
     text_msg = format_deal(deal)
     try:
         if deal.get("img"):
@@ -641,32 +597,93 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 text=text_msg,
                 parse_mode="Markdown"
             )
-        await update.message.reply_text(
-            f"✅ Publicado en el canal.\n"
-            f"📦 *{deal['title'][:40]}*\n"
-            f"💰 ${deal['price']:,.0f} MXN",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("✅ Publicado en el canal.")
     except Exception as e:
         await update.message.reply_text(f"❌ Error publicando: {e}")
 
+async def cmd_limpiar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Solo admin puede limpiar el historial de ofertas vistas"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    save_json(SEEN_DEALS_FILE, [])
+    await update.message.reply_text("🗑️ Historial limpiado. La próxima búsqueda mostrará todas las ofertas.")
+
+async def cmd_salir(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    ids = load_json(CHAT_IDS_FILE, [])
+    if cid in ids:
+        ids.remove(cid)
+        save_json(CHAT_IDS_FILE, ids)
+    await update.message.reply_text("👋 Te diste de baja. Escribe /start para volver.")
+
+async def cmd_token(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Solo admin — muestra estado del token y fuerza renovación si se pide."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    args = ctx.args
+    if args and args[0] == "renovar":
+        await update.message.reply_text("🔄 Forzando renovación de token...")
+        success = await _refresh_access_token()
+        if success:
+            remaining = _ml_token_data.get("expires_at", 0) - time.time()
+            hours = int(remaining // 3600)
+            mins  = int((remaining % 3600) // 60)
+            await update.message.reply_text(f"✅ Token renovado. Expira en {hours}h {mins}m.")
+        else:
+            await update.message.reply_text("❌ No se pudo renovar. Revisa las credenciales.")
+    else:
+        if _ml_token_data.get("access_token"):
+            remaining = _ml_token_data.get("expires_at", 0) - time.time()
+            if remaining > 0:
+                hours = int(remaining // 3600)
+                mins  = int((remaining % 3600) // 60)
+                status = f"✅ Activo — expira en {hours}h {mins}m"
+            else:
+                status = "⚠️ Expirado — se renovará automáticamente en la próxima petición"
+            # Mostrar primeros/últimos chars del token para verificación
+            t = _ml_token_data["access_token"]
+            masked = f"{t[:8]}...{t[-4:]}" if len(t) > 12 else "***"
+            await update.message.reply_text(
+                f"🔑 *Estado OAuth de Mercado Libre*\n\n"
+                f"Token: `{masked}`\n"
+                f"Estado: {status}\n\n"
+                f"Usa `/token renovar` para forzar renovación.",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                "❌ No hay token configurado.\n\n"
+                "Configura las variables de entorno:\n"
+                "• `ML_CLIENT_ID`\n"
+                "• `ML_CLIENT_SECRET`\n"
+                "• `ML_ACCESS_TOKEN`\n"
+                "• `ML_REFRESH_TOKEN`",
+                parse_mode="Markdown"
+            )
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Cargar tokens OAuth al iniciar
+    _load_tokens()
 
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("ofertas", cmd_ofertas))
     app.add_handler(CommandHandler("buscar",  cmd_buscar))
     app.add_handler(CommandHandler("estado",  cmd_estado))
-    app.add_handler(CommandHandler("salir",   cmd_salir))
-    app.add_handler(CommandHandler("limpiar", cmd_limpiar))
+    app.add_handler(CommandHandler("salir",    cmd_salir))
+    app.add_handler(CommandHandler("limpiar",  cmd_limpiar))
+    app.add_handler(CommandHandler("token",    cmd_token))
+    # Handler para links enviados por el admin
+    from telegram.ext import MessageHandler, filters
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"https?://"), handle_link))
 
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(broadcast, "interval", hours=3, args=[app.bot])
+    scheduler.add_job(broadcast, "interval", minutes=10, args=[app.bot])
     scheduler.start()
 
-    logger.info("🤖 JackRocko Bot iniciado")
+    logger.info("🤖 JackRocko Bot iniciado con OAuth de Mercado Libre")
     app.run_polling()
 
 if __name__ == "__main__":
