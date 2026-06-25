@@ -113,15 +113,25 @@ def cupones_text() -> str:
     return f"\n\n💳 *Cupones bancarios:*\n{lineas}"
 
 def format_deal(deal: dict) -> str:
-    cupones = cupones_text()
-    original = deal.get("original", 0)
-    price    = deal.get("price", 0)
-    discount = deal.get("discount", 0)
-    orig_str = f"~${original:,.0f}~ → " if original > price else ""
+    cupones   = cupones_text()
+    original  = deal.get("original", 0)
+    price     = deal.get("price", 0)
+    discount  = deal.get("discount", 0)
+
+    # Precio final = precio de oferta (ya con descuento aplicado)
+    final_price = price
+
+    # Línea de precio: tachado → precio final
+    if original > price:
+        price_line = f"~~${original:,.0f}~~ → 💵 *${final_price:,.0f} MXN*"
+    else:
+        price_line = f"💵 *${final_price:,.0f} MXN*"
+
     disc_str = f"\n🏷️ *{discount}% OFF*" if discount >= MIN_DISCOUNT else ""
+
     return (
         f"🔥 *{deal['title']}*\n\n"
-        f"💰 {orig_str}*${price:,.0f} MXN*"
+        f"💰 Precio final: {price_line}"
         f"{disc_str}"
         f"{cupones}\n\n"
         f"🛒 [Ver oferta en Mercado Libre]({deal['url']})"
