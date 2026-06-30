@@ -48,7 +48,7 @@ ADMIN_ID       = 333569583  # Solo Edwing puede mandar links
 
 CHAT_IDS_FILE  = "chat_ids.json"
 SEEN_DEALS_FILE = "seen_deals.json"
-MIN_DISCOUNT   = 10
+MIN_DISCOUNT   = 5
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
@@ -312,115 +312,80 @@ async def search_api(keyword: str, min_discount: int = MIN_DISCOUNT) -> list:
         auth_headers = _ml_auth_headers(token)
 
         async with httpx.AsyncClient(timeout=15) as client:
+            # Agregamos sort=price_asc y offset para variar resultados
             r = await client.get(
                 "https://api.mercadolibre.com/sites/MLM/search",
-                params={"q": keyword, "limit": 30},
+                params={"q": keyword, "limit": 50},
                 headers=auth_headers,
             )
 
             if r.status_code == 401 and token:
-                # Token inválido — intentar renovar y reintentar
-                logger.warning("⚠️ Token rechazado (401), renovando...")
+                logger.warning(f"⚠️ Token rechazado en búsqueda '{keyword}', renovando...")
                 if await _refresh_access_token():
                     token = _ml_token_data["access_token"]
                     auth_headers = _ml_auth_headers(token)
                     r = await client.get(
                         "https://api.mercadolibre.com/sites/MLM/search",
-                        params={"q": keyword, "limit": 30},
+                        params={"q": keyword, "limit": 50},
                         headers=auth_headers,
                     )
-
-            if r.status_code == 403:
-                logger.error(f"❌ 403 Forbidden en búsqueda '{keyword}' — verificar permisos OAuth")
-                return deals
 
             if r.status_code != 200:
                 logger.error(f"❌ API respondió {r.status_code} para '{keyword}'")
                 return deals
 
-            for item in r.json().get("results", []):
+            results = r.json().get("results", [])
+            logger.info(f"API '{keyword}': {len(results)} resultados crudos encontrados")
+
+            for item in results:
                 price    = item.get("price", 0)
                 original = item.get("original_price", 0)
+                
+                # Si no hay precio original, intentamos buscarlo en otros campos o asumimos el actual
                 if not original or original <= price:
+                    # A veces la API manda promociones en 'sale_price' o campos similares
+                    # Por ahora, si no hay original, no podemos calcular % de descuento real
                     continue
 
-                # Cálculo de descuento: discount = (1 - precio_final/precio_original) × 100
-                # Verificación inversa: precio_final = precio_original × (1 - discount/100)
                 discount = round((1 - price / original) * 100)
                 if discount < min_discount:
                     continue
 
-                # Imagen
                 thumb = item.get("thumbnail","")
                 img   = thumb.replace("-I.jpg","").replace("-O.jpg","").replace("http://","https://")
-                # Atributos técnicos
                 attrs = {a["id"]: a.get("value_name","") for a in item.get("attributes",[])}
+                
                 deals.append({
                     "id":           item["id"],
                     "title":        item["title"][:70],
-                    "price":        price,         # precio_final (con descuento)
-                    "original":     original,      # precio_original (sin descuento)
-                    "discount":     discount,      # porcentaje OFF
+                    "price":        price,
+                    "original":     original,
+                    "discount":     discount,
                     "url":          make_affiliate_link(item["permalink"]),
                     "img":          img,
                     "condition":    item.get("condition",""),
-                    "sold_quantity": item.get("sold_quantity", 0),
-                    "brand":        attrs.get("BRAND",""),
-                    "model":        attrs.get("MODEL",""),
-                    "ram":          attrs.get("RAM",""),
-                    "storage":      attrs.get("STORAGE_CAPACITY",""),
                 })
     except Exception as e:
         logger.error(f"API error [{keyword}]: {e}")
     return deals
 
-# ── Consulta de un item específico con autenticación ──────────────────────────
-async def get_item_by_id(item_id: str) -> dict | None:
-    """
-    Obtiene información de un producto por su ID (ej: MLM123456)
-    usando autenticación OAuth para evitar 403.
-    """
-    try:
-        token = await get_ml_access_token()
-        auth_headers = _ml_auth_headers(token)
-
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(
-                f"https://api.mercadolibre.com/items/{item_id}",
-                headers=auth_headers,
-            )
-
-            if r.status_code == 401 and token:
-                logger.warning("⚠️ Token rechazado (401) en get_item, renovando...")
-                if await _refresh_access_token():
-                    auth_headers = _ml_auth_headers(_ml_token_data["access_token"])
-                    r = await client.get(
-                        f"https://api.mercadolibre.com/items/{item_id}",
-                        headers=auth_headers,
-                    )
-
-            if r.status_code != 200:
-                logger.error(f"❌ Error obteniendo item {item_id}: {r.status_code}")
-                return None
-
-            return r.json()
-    except Exception as e:
-        logger.error(f"Error get_item {item_id}: {e}")
-        return None
-
 async def get_all_deals() -> list:
     deals = []
-    # Usar API de ML con autenticación como fuente principal
+    # Keywords más amplias y variadas
     keywords = [
-        "laptop reacondicionado", "tablet oferta", "smartphone descuento",
-        "audifonos bluetooth", "smartwatch barato", "consola videojuegos",
-        "ssd disco duro", "monitor pc", "bocina portatil", "camara seguridad"
+        "oferta del dia", "remate", "liquidación", "descuento",
+        "laptop", "smartphone", "smartwatch", "audifonos", 
+        "consola", "monitor", "gaming"
     ]
     for kw in keywords:
         deals += await search_api(kw)
-    # Scraping como complemento
+    
+    # Intentar también scraping de secciones específicas
     deals += await scrape_ofertas()
-    return list({d["id"]: d for d in deals if d["price"] > 0}.values())
+    
+    unique = list({d["id"]: d for d in deals if d["price"] > 0}.values())
+    logger.info(f"Final: {len(unique)} ofertas únicas encontradas")
+    return unique
 
 # ── Envío de mensajes ──────────────────────────────────────────────────────────
 async def send_deals(bot: Bot, deals: list, chat_id: int, limit: int = 5) -> int:
