@@ -134,10 +134,12 @@ def format_deal(deal: dict) -> str:
         f"🏷️ <b>{deal['discount']}% OFF</b>"
         if deal.get("discount", 0) > 0 else "🔥 ¡Gran Precio!"
     )
+    # Envío gratis: cuando aplica, el precio mostrado ES el precio final.
+    ship_str = "\n🚚 <b>Envío GRATIS</b>" if deal.get("free_shipping") else ""
     return (
         f"🔥 <b>{title}</b>\n\n"
         f"💰 {orig_str}<b>{price_str}</b>\n"
-        f"{disc_str}\n\n"
+        f"{disc_str}{ship_str}\n\n"
         f"🛒 <a href=\"{html.escape(deal['url'])}\">Ver en Mercado Libre</a>"
     )
 
@@ -190,6 +192,7 @@ async def fetch_api_deals() -> list:
                         "discount": disc,
                         "url":      make_affiliate_link(item.get("permalink", "")),
                         "img":      (item.get("thumbnail") or "").replace("http://", "https://"),
+                        "free_shipping": bool((item.get("shipping") or {}).get("free_shipping")),
                     })
             except httpx.HTTPError as e:
                 logger.error(f"Error API: {e}")
@@ -236,6 +239,8 @@ def _extract_embedded_json(html_text: str) -> list:
                 link  = node.get("permalink") or node.get("url") or ""
                 if price > 0 and title and link:
                     disc = round((1 - price / orig) * 100) if orig > price else 0
+                    ship = node.get("shipping") or {}
+                    free = bool(ship.get("free_shipping")) if isinstance(ship, dict) else False
                     deals.append({
                         "id":       pid,
                         "title":    str(title)[:80],
@@ -244,6 +249,7 @@ def _extract_embedded_json(html_text: str) -> list:
                         "discount": disc,
                         "url":      make_affiliate_link(str(link)),
                         "img":      str(node.get("picture") or node.get("thumbnail") or ""),
+                        "free_shipping": free,
                     })
             for v in node.values():
                 walk(v)
@@ -295,6 +301,10 @@ def _extract_css(soup: BeautifulSoup) -> list:
             if not id_m:
                 continue  # sin ID real no publicamos
 
+            # Envío gratis: ML muestra un badge con texto "Envío gratis"
+            ship_txt = item.get_text(" ", strip=True).lower()
+            free = "envío gratis" in ship_txt or "envio gratis" in ship_txt
+
             deals.append({
                 "id":       f"MLM{id_m.group(1)}",
                 "title":    title[:80],
@@ -303,6 +313,7 @@ def _extract_css(soup: BeautifulSoup) -> list:
                 "discount": disc,
                 "url":      make_affiliate_link(link),
                 "img":      img,
+                "free_shipping": free,
             })
         except (ValueError, AttributeError) as e:
             logger.debug(f"Item {i} descartado: {e}")
