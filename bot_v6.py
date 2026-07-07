@@ -1,11 +1,18 @@
 """
-JackRocko Bot v6 — Ofertas de Mercado Libre → Telegram
+JackRocko Bot v6.1 — Ofertas de Mercado Libre → Telegram
 ========================================================
-Correcciones respecto a v5:
+Cambios respecto a v6:
+ [11] Refresh automático de token ML (módulo ml_auth.py, importado aquí).
+      Ya no se depende de pegar ML_ACCESS_TOKEN a mano cada 6 horas: el
+      bot lo renueva solo usando ML_CLIENT_ID + ML_CLIENT_SECRET +
+      ML_REFRESH_TOKEN. /status ahora muestra minutos de vida restante
+      en vez de solo "configurado".
+
+Correcciones de v6 (se mantienen todas):
   [1] Scheduler: APScheduler eliminado. Ahora usa el JobQueue integrado de
       python-telegram-bot, que corre DENTRO del event loop correcto.
-  [2] API de ML: soporta token OAuth (ML_ACCESS_TOKEN). Sin token, la fuente
-      se omite con un aviso claro en logs (el endpoint ya no es público).
+  [2] API de ML: soporta token OAuth. Sin token, la fuente se omite con un
+      aviso claro en logs (el endpoint ya no es público).
   [3] Formato: parse_mode HTML con html.escape() — títulos con *, _, [, %
       ya no rompen el envío. Tachado real con <s>.
   [4] Persistencia: los JSON viven en DATA_DIR (montar volumen de Railway
@@ -22,15 +29,20 @@ Correcciones respecto a v5:
  [10] /status para el admin: salud de fuentes en un mensaje.
 
 Variables de entorno requeridas en Railway:
-  BOT_TOKEN        → token NUEVO de @BotFather (revocar el filtrado)
-  CHANNEL_ID       → -1004405739696
-  ADMIN_ID         → 333569583
-  AFFILIATE_ID     → 293AH0-18PY
-  ML_ACCESS_TOKEN  → (opcional pero MUY recomendado) token OAuth del
-                     DevCenter de ML: https://developers.mercadolibre.com.mx
-  MATT_TOOL_ID     → (opcional) ID numérico de herramienta de afiliados
-  DATA_DIR         → /data  (montar volumen de Railway ahí)
-  MIN_DISCOUNT     → descuento mínimo % para publicar (default 15)
+  BOT_TOKEN         → token de @BotFather
+  CHANNEL_ID        → -1004405739696
+  ADMIN_ID          → 333569583
+  AFFILIATE_ID      → 293AH0-18PY
+  ML_CLIENT_ID      → App ID del DevCenter de ML          [NUEVO v6.1]
+  ML_CLIENT_SECRET  → Secret Key del DevCenter de ML       [NUEVO v6.1]
+  ML_REFRESH_TOKEN  → refresh_token ya obtenido            [NUEVO v6.1]
+  MATT_TOOL_ID      → (opcional) ID numérico de herramienta de afiliados
+  DATA_DIR          → /data  (montar volumen de Railway ahí)
+  MIN_DISCOUNT      → descuento mínimo % para publicar (default 15)
+
+  ML_ACCESS_TOKEN ya NO es necesaria — el bot obtiene y renueva el
+  access_token solo a partir de las 3 variables ML_CLIENT_* de arriba.
+  Puedes dejarla o borrarla de Railway, no se usa.
 """
 
 import json
@@ -48,6 +60,8 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+from ml_auth import ml_token_manager  # [NUEVO v6.1] renovación automática
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -62,7 +76,6 @@ AFFILIATE_ID    = os.getenv("AFFILIATE_ID", "293AH0-18PY")
 MATT_TOOL_ID    = os.getenv("MATT_TOOL_ID", "")            # numérico, opcional
 CHANNEL_ID      = int(os.getenv("CHANNEL_ID", "0"))
 ADMIN_ID        = int(os.getenv("ADMIN_ID", "0"))
-ML_ACCESS_TOKEN = os.getenv("ML_ACCESS_TOKEN", "")
 MIN_DISCOUNT    = int(os.getenv("MIN_DISCOUNT", "15"))
 BROADCAST_MIN   = int(os.getenv("BROADCAST_MINUTES", "15"))
 
@@ -134,7 +147,6 @@ def format_deal(deal: dict) -> str:
         f"🏷️ <b>{deal['discount']}% OFF</b>"
         if deal.get("discount", 0) > 0 else "🔥 ¡Gran Precio!"
     )
-    # Envío gratis: cuando aplica, el precio mostrado ES el precio final.
     ship_str = "\n🚚 <b>Envío GRATIS</b>" if deal.get("free_shipping") else ""
     return (
         f"🔥 <b>{title}</b>\n\n"
@@ -145,18 +157,18 @@ def format_deal(deal: dict) -> str:
 
 # ── FUENTE 1: API oficial de ML (requiere token OAuth) ─────────────────────────
 async def fetch_api_deals() -> list:
-    if not ML_ACCESS_TOKEN:
+    # [NUEVO v6.1] el token ya no viene de una variable fija: se pide al
+    # manager, que lo renueva solo si está por vencer o ya venció.
+    token = ml_token_manager.get_token()
+    if token is None:
         logger.warning(
-            "⚠️ ML_ACCESS_TOKEN no configurado — fuente API omitida. "
-            "El endpoint de búsqueda ya NO es público. Registra una app en "
-            "https://developers.mercadolibre.com.mx y agrega el token."
+            "⚠️ Sin token ML válido — fuente API omitida. Detalle: %s",
+            ml_token_manager.last_error,
         )
         return []
 
     deals = []
     queries = [
-        # Búsquedas de categorías populares; el descuento real se calcula
-        # con original_price y se filtra con MIN_DISCOUNT.
         "https://api.mercadolibre.com/sites/MLM/search?q=audifonos&limit=50",
         "https://api.mercadolibre.com/sites/MLM/search?q=smartwatch&limit=50",
         "https://api.mercadolibre.com/sites/MLM/search?q=laptop&limit=50",
@@ -164,7 +176,7 @@ async def fetch_api_deals() -> list:
     ]
     api_headers = {
         "User-Agent": HEADERS["User-Agent"],
-        "Authorization": f"Bearer {ML_ACCESS_TOKEN}",
+        "Authorization": f"Bearer {token}",
     }
     async with httpx.AsyncClient(timeout=20, headers=api_headers) as client:
         for url in queries:
@@ -172,7 +184,10 @@ async def fetch_api_deals() -> list:
                 r = await client.get(url)
                 logger.info(f"API status {r.status_code} → {url[:70]}")
                 if r.status_code == 401:
-                    logger.error("❌ Token de ML inválido o expirado (401). Renuévalo en el DevCenter.")
+                    logger.error(
+                        "❌ Token de ML rechazado (401) incluso tras renovar. "
+                        "Revisa ML_CLIENT_ID/ML_CLIENT_SECRET/ML_REFRESH_TOKEN."
+                    )
                     return deals
                 if r.status_code != 200:
                     continue
@@ -180,7 +195,7 @@ async def fetch_api_deals() -> list:
                     price = item.get("price") or 0
                     orig  = item.get("original_price") or 0
                     if price <= 0 or orig <= price:
-                        continue  # sin descuento real → no interesa
+                        continue
                     disc = round((1 - price / orig) * 100)
                     if disc < MIN_DISCOUNT:
                         continue
@@ -201,11 +216,6 @@ async def fetch_api_deals() -> list:
 
 # ── FUENTE 2: Scraper de /ofertas ──────────────────────────────────────────────
 def _extract_embedded_json(html_text: str) -> list:
-    """
-    ML incrusta el estado inicial de la página en un <script> como JSON.
-    Es MUCHO más estable que los selectores CSS. Buscamos objetos con
-    pinta de producto (id MLM + price) en ese estado.
-    """
     deals = []
     patterns = [
         r"window\.__PRELOADED_STATE__\s*=\s*({.*?});",
@@ -261,8 +271,6 @@ def _extract_embedded_json(html_text: str) -> list:
     return deals
 
 def _extract_css(soup: BeautifulSoup) -> list:
-    """Plan B: selectores CSS ESPECÍFICOS. Sin fallbacks genéricos que
-    publiquen basura ('Producto 7 — $0') en el canal."""
     deals = []
     containers = (
         soup.select("li.promotion-item")
@@ -299,9 +307,8 @@ def _extract_css(soup: BeautifulSoup) -> list:
 
             id_m = re.search(r"MLM-?(\d+)", link)
             if not id_m:
-                continue  # sin ID real no publicamos
+                continue
 
-            # Envío gratis: ML muestra un badge con texto "Envío gratis"
             ship_txt = item.get_text(" ", strip=True).lower()
             free = "envío gratis" in ship_txt or "envio gratis" in ship_txt
 
@@ -332,19 +339,16 @@ async def fetch_scraper_deals() -> list:
         logger.error(f"Scraper HTTP {r.status_code}")
         return []
 
-    # Detección de bloqueo/captcha
     lowered = r.text[:3000].lower()
     if "captcha" in lowered or "robot" in lowered:
         logger.error("🚫 ML está sirviendo un captcha — IP posiblemente bloqueada.")
         return []
 
-    # 1) JSON embebido (estable)
     deals = _extract_embedded_json(r.text)
     if deals:
         logger.info(f"Scraper (JSON embebido): {len(deals)} productos")
         return deals
 
-    # 2) CSS específico (plan B)
     deals = _extract_css(BeautifulSoup(r.text, "html.parser"))
     if deals:
         logger.info(f"Scraper (CSS): {len(deals)} productos")
@@ -360,11 +364,8 @@ async def get_all_deals() -> list:
     api_deals, scraper_deals = await asyncio.gather(
         fetch_api_deals(), fetch_scraper_deals()
     )
-    # El scraper va al final para que su versión gane en duplicados
-    # (suele traer el descuento mostrado en la página, más confiable).
     combined = api_deals + scraper_deals
     unique = list({d["id"]: d for d in combined}.values())
-    # Mejores descuentos primero
     unique.sort(key=lambda d: d.get("discount", 0), reverse=True)
     logger.info(f"📢 Total único: {len(unique)} ofertas")
     return unique
@@ -378,7 +379,7 @@ async def _send_one(bot, chat_id: int, deal: dict) -> bool:
                 await bot.send_photo(chat_id, deal["img"], caption=text, parse_mode=ParseMode.HTML)
                 return True
             except TelegramError:
-                pass  # imagen falló (hotlink, formato) → texto plano
+                pass
         await bot.send_message(
             chat_id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=False
         )
@@ -388,8 +389,6 @@ async def _send_one(bot, chat_id: int, deal: dict) -> bool:
         return False
 
 async def broadcast(context: ContextTypes.DEFAULT_TYPE):
-    """Job periódico: calcula ofertas nuevas UNA vez y reparte el mismo
-    lote al canal y a los suscriptores (nadie recibe 'sobras')."""
     bot = context.bot
     deals = await get_all_deals()
     if not deals:
@@ -489,10 +488,12 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     subs = load_json(CHAT_IDS_FILE, [])
     seen = load_json(SEEN_DEALS_FILE, [])
-    token_state = "✅ configurado" if ML_ACCESS_TOKEN else "❌ FALTA (fuente API muerta)"
+    # [NUEVO v6.1] estado real del token (minutos restantes o error), no
+    # solo si la variable existe.
+    token_state = ml_token_manager.status_summary()
     data_state  = "✅ /data (persistente)" if DATA_DIR != "." else "⚠️ efímero (montar volumen)"
     await update.message.reply_text(
-        f"<b>Estado JackRocko v6</b>\n\n"
+        f"<b>Estado JackRocko v6.1</b>\n\n"
         f"🔑 Token ML: {token_state}\n"
         f"📡 API: {len(api_deals)} ofertas\n"
         f"🕷 Scraper: {len(scraper_deals)} ofertas\n"
@@ -514,11 +515,9 @@ def main():
     app.add_handler(CommandHandler("reset",   cmd_reset))
     app.add_handler(CommandHandler("status",  cmd_status))
 
-    # [FIX 1] JobQueue de PTB: corre dentro del event loop correcto.
-    # first=15 → primer broadcast 15s después de arrancar (útil para verificar).
     app.job_queue.run_repeating(broadcast, interval=BROADCAST_MIN * 60, first=15)
 
-    logger.info("🚀 JackRocko Bot v6 iniciado")
+    logger.info("🚀 JackRocko Bot v6.1 iniciado")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
