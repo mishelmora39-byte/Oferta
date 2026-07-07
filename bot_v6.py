@@ -378,11 +378,35 @@ async def resolve_and_fetch_item(raw_url: str) -> dict | None:
             logger.warning(f"Link manual: no se pudo resolver redirección: {e}")
             # seguimos con la URL original por si ya era la final
 
-    id_m = re.search(r"MLM-?(\d+)", final_url) or re.search(r"MLM-?(\d+)", raw_url)
-    if not id_m:
+    # Prioridad para encontrar el ID de ARTÍCULO real (no el de catálogo):
+    #   1) wid=MLM... → "winning item id", el artículo específico mostrado
+    #      en páginas de catálogo (/p/MLM...) con varios vendedores.
+    #   2) pdp_filters=deal:MLM... → mismo caso, formato alterno.
+    #   3) MLM-XXXXXXXXXX en el path → link directo de artículo (el caso
+    #      simple, como articulo.mercadolibre.com.mx/MLM-...).
+    # Si solo se encuentra el ID de catálogo (/p/MLM...), lo usamos como
+    # último recurso, aunque la API de items puede no reconocerlo.
+    combined = f"{final_url} {raw_url}"
+    wid_m = re.search(r"[?&#]wid=(MLM\d+)", combined)
+    deal_m = re.search(r"deal%3A(MLM\d+)|deal:(MLM\d+)", combined)
+    path_m = re.search(r"(?<!/p/)MLM-(\d+)(?!\?)", combined)  # link directo típico
+    catalog_m = re.search(r"/p/(MLM\d+)", combined)
+
+    if wid_m:
+        item_id = wid_m.group(1)
+    elif deal_m:
+        item_id = deal_m.group(1) or deal_m.group(2)
+    elif path_m:
+        item_id = f"MLM{path_m.group(1)}"
+    elif catalog_m:
+        item_id = catalog_m.group(1)
+        logger.info(
+            f"Link manual: solo se encontró ID de catálogo ({item_id}), "
+            "puede que la API de items no lo reconozca."
+        )
+    else:
         logger.warning(f"Link manual: no se encontró ID de producto en {final_url}")
         return None
-    item_id = f"MLM{id_m.group(1)}"
 
     # 2) Intento vía API de detalle de item (histórico: menos restringida
     #    que la búsqueda, aunque no hay garantía si ML sigue endureciendo)
