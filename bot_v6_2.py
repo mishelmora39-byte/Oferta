@@ -1,48 +1,40 @@
 """
-JackRocko Bot v6.1 — Ofertas de Mercado Libre → Telegram
+JackRocko Bot v6.2 — Ofertas de Mercado Libre → Telegram
 ========================================================
-Cambios respecto a v6:
- [11] Refresh automático de token ML (módulo ml_auth.py, importado aquí).
-      Ya no se depende de pegar ML_ACCESS_TOKEN a mano cada 6 horas: el
-      bot lo renueva solo usando ML_CLIENT_ID + ML_CLIENT_SECRET +
-      ML_REFRESH_TOKEN. /status ahora muestra minutos de vida restante
-      en vez de solo "configurado".
+Cambios respecto a v6.1:
+ [12] Handler de link manual (admin): pegas cualquier link de producto
+      de Mercado Libre o meli.la y el bot extrae título/precio/foto,
+      le pone tu link de afiliado, y lo publica directo en el canal.
+      Este feature existía en v4/v5 y se había perdido en la reescritura
+      de v6 — ya está de vuelta.
+
+Cambios de v6.1 (se mantienen):
+ [11] Refresh automático de token ML (módulo ml_auth.py).
 
 Correcciones de v6 (se mantienen todas):
-  [1] Scheduler: APScheduler eliminado. Ahora usa el JobQueue integrado de
-      python-telegram-bot, que corre DENTRO del event loop correcto.
-  [2] API de ML: soporta token OAuth. Sin token, la fuente se omite con un
-      aviso claro en logs (el endpoint ya no es público).
-  [3] Formato: parse_mode HTML con html.escape() — títulos con *, _, [, %
-      ya no rompen el envío. Tachado real con <s>.
-  [4] Persistencia: los JSON viven en DATA_DIR (montar volumen de Railway
-      en /data). Escritura atómica (tmp + os.replace) para evitar corrupción.
-  [5] Afiliado: el tag va en matt_word (no en matt_tool). matt_tool es
-      opcional y numérico (MATT_TOOL_ID).
-  [6] Scraper endurecido: primero intenta el JSON embebido en la página
-      (__PRELOADED_STATE__ / __NEXT_DATA__), luego selectores CSS específicos.
-      Sin fallbacks genéricos tipo <article> que publicaban basura.
-  [7] Broadcast: las ofertas nuevas se calculan UNA vez y se reparten a
-      canal y suscriptores del mismo lote (antes el canal "quemaba" todo).
-  [8] Rate limit en /ofertas (cooldown por chat) para no invitar bloqueos.
-  [9] Historial ampliado a 2000 IDs para evitar re-envíos cíclicos.
- [10] /status para el admin: salud de fuentes en un mensaje.
+  [1] Scheduler: JobQueue integrado de python-telegram-bot.
+  [2] API de ML: soporta token OAuth con refresh automático.
+  [3] Formato: parse_mode HTML con html.escape().
+  [4] Persistencia: JSON en DATA_DIR, escritura atómica.
+  [5] Afiliado: el tag va en matt_word.
+  [6] Scraper endurecido: JSON embebido primero, CSS específico después.
+  [7] Broadcast: mismo lote para canal y suscriptores.
+  [8] Rate limit en /ofertas.
+  [9] Historial ampliado a 2000 IDs.
+ [10] /status para el admin.
 
 Variables de entorno requeridas en Railway:
   BOT_TOKEN         → token de @BotFather
   CHANNEL_ID        → -1004405739696
   ADMIN_ID          → 333569583
   AFFILIATE_ID      → 293AH0-18PY
-  ML_CLIENT_ID      → App ID del DevCenter de ML          [NUEVO v6.1]
-  ML_CLIENT_SECRET  → Secret Key del DevCenter de ML       [NUEVO v6.1]
-  ML_REFRESH_TOKEN  → refresh_token ya obtenido            [NUEVO v6.1]
+  ML_CLIENT_ID      → App ID del DevCenter de ML
+  ML_CLIENT_SECRET  → Secret Key del DevCenter de ML
+  ML_REFRESH_TOKEN  → refresh_token ya obtenido
   MATT_TOOL_ID      → (opcional) ID numérico de herramienta de afiliados
   DATA_DIR          → /data  (montar volumen de Railway ahí)
-  MIN_DISCOUNT      → descuento mínimo % para publicar (default 15)
-
-  ML_ACCESS_TOKEN ya NO es necesaria — el bot obtiene y renueva el
-  access_token solo a partir de las 3 variables ML_CLIENT_* de arriba.
-  Puedes dejarla o borrarla de Railway, no se usa.
+  MIN_DISCOUNT      → descuento mínimo % para publicar en broadcast automático
+                       (NO aplica a links manuales — esos siempre se publican)
 """
 
 import json
@@ -58,28 +50,26 @@ from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-from ml_auth import ml_token_manager  # [NUEVO v6.1] renovación automática
+from ml_auth import ml_token_manager
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-# Silenciar el spam de getUpdates en los logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("jackrocko")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 BOT_TOKEN       = os.getenv("BOT_TOKEN", "")
 AFFILIATE_ID    = os.getenv("AFFILIATE_ID", "293AH0-18PY")
-MATT_TOOL_ID    = os.getenv("MATT_TOOL_ID", "")            # numérico, opcional
+MATT_TOOL_ID    = os.getenv("MATT_TOOL_ID", "")
 CHANNEL_ID      = int(os.getenv("CHANNEL_ID", "0"))
 ADMIN_ID        = int(os.getenv("ADMIN_ID", "0"))
 MIN_DISCOUNT    = int(os.getenv("MIN_DISCOUNT", "15"))
 BROADCAST_MIN   = int(os.getenv("BROADCAST_MINUTES", "15"))
 
-# Persistencia: montar un volumen de Railway en /data
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 if not os.path.isdir(DATA_DIR) or not os.access(DATA_DIR, os.W_OK):
     logger.warning(
@@ -103,9 +93,14 @@ HEADERS = {
     "Connection": "keep-alive",
 }
 
-# Cooldown de /ofertas por chat (segundos)
 OFERTAS_COOLDOWN = 60
 _last_ofertas: dict[int, float] = {}
+
+# Detecta links de ML o meli.la en texto libre
+LINK_RE = re.compile(
+    r"https?://\S*(?:mercadolibre\.com|meli\.la)\S*",
+    re.IGNORECASE,
+)
 
 # ── Persistencia segura ────────────────────────────────────────────────────────
 def load_json(path: str, default):
@@ -119,7 +114,6 @@ def load_json(path: str, default):
         return default
 
 def save_json(path: str, data) -> None:
-    """Escritura atómica: nunca deja un archivo a medias."""
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
@@ -135,7 +129,7 @@ def make_affiliate_link(url: str) -> str:
         params.insert(0, f"matt_tool={MATT_TOOL_ID}")
     return f"{clean}?{'&'.join(params)}"
 
-# ── Formato de mensaje (HTML: a prueba de títulos con símbolos) ────────────────
+# ── Formato de mensaje ──────────────────────────────────────────────────────────
 def format_deal(deal: dict) -> str:
     title     = html.escape(deal["title"])
     price_str = f"${deal['price']:,.0f} MXN"
@@ -155,10 +149,8 @@ def format_deal(deal: dict) -> str:
         f"🛒 <a href=\"{html.escape(deal['url'])}\">Ver en Mercado Libre</a>"
     )
 
-# ── FUENTE 1: API oficial de ML (requiere token OAuth) ─────────────────────────
+# ── FUENTE 1: API oficial de ML ─────────────────────────────────────────────────
 async def fetch_api_deals() -> list:
-    # [NUEVO v6.1] el token ya no viene de una variable fija: se pide al
-    # manager, que lo renueva solo si está por vencer o ya venció.
     token = ml_token_manager.get_token()
     if token is None:
         logger.warning(
@@ -370,6 +362,142 @@ async def get_all_deals() -> list:
     logger.info(f"📢 Total único: {len(unique)} ofertas")
     return unique
 
+# ── Link manual (admin) ─────────────────────────────────────────────────────────
+async def resolve_and_fetch_item(raw_url: str) -> dict | None:
+    """Dado un link de ML o meli.la (corto o largo), regresa un dict de
+    oferta compatible con format_deal(). Primero intenta la API oficial
+    de item (más confiable), y si falla, hace scraping directo de la
+    página del producto."""
+    # 1) Resolver redirecciones (meli.la son links cortos)
+    final_url = raw_url
+    async with httpx.AsyncClient(timeout=15, headers=HEADERS, follow_redirects=True) as client:
+        try:
+            r = await client.get(raw_url)
+            final_url = str(r.url)
+        except httpx.HTTPError as e:
+            logger.warning(f"Link manual: no se pudo resolver redirección: {e}")
+            # seguimos con la URL original por si ya era la final
+
+    id_m = re.search(r"MLM-?(\d+)", final_url) or re.search(r"MLM-?(\d+)", raw_url)
+    if not id_m:
+        logger.warning(f"Link manual: no se encontró ID de producto en {final_url}")
+        return None
+    item_id = f"MLM{id_m.group(1)}"
+
+    # 2) Intento vía API de detalle de item (histórico: menos restringida
+    #    que la búsqueda, aunque no hay garantía si ML sigue endureciendo)
+    token = ml_token_manager.get_token()
+    api_headers = {"User-Agent": HEADERS["User-Agent"]}
+    if token:
+        api_headers["Authorization"] = f"Bearer {token}"
+    try:
+        async with httpx.AsyncClient(timeout=15, headers=api_headers) as client:
+            r = await client.get(f"https://api.mercadolibre.com/items/{item_id}")
+        if r.status_code == 200:
+            item = r.json()
+            price = item.get("price") or 0
+            orig  = item.get("original_price") or 0
+            title = item.get("title", "")
+            permalink = item.get("permalink") or final_url
+            pictures = item.get("pictures") or []
+            img = pictures[0].get("secure_url", "") if pictures else ""
+            free_shipping = bool((item.get("shipping") or {}).get("free_shipping"))
+            if title and price > 0:
+                disc = round((1 - price / orig) * 100) if orig > price else 0
+                logger.info(f"Link manual: datos vía API para {item_id}")
+                return {
+                    "id":       item_id,
+                    "title":    title[:80],
+                    "price":    price,
+                    "original": orig if orig > price else price,
+                    "discount": disc,
+                    "url":      make_affiliate_link(permalink),
+                    "img":      img,
+                    "free_shipping": free_shipping,
+                }
+        else:
+            logger.info(f"Link manual: API item respondió {r.status_code}, probando scraping")
+    except httpx.HTTPError as e:
+        logger.warning(f"Link manual: fallo llamando a API item: {e}")
+
+    # 3) Fallback: scraping directo de la página del producto
+    try:
+        async with httpx.AsyncClient(timeout=20, headers=HEADERS, follow_redirects=True) as client:
+            r = await client.get(final_url)
+    except httpx.HTTPError as e:
+        logger.error(f"Link manual: fallo scraping página de producto: {e}")
+        return None
+    if r.status_code != 200:
+        logger.error(f"Link manual: HTTP {r.status_code} en página de producto")
+        return None
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    title_el = soup.select_one("h1.ui-pdp-title")
+    price_el = soup.select_one(".ui-pdp-price__second-line .andes-money-amount__fraction") \
+        or soup.select_one(".andes-money-amount__fraction")
+    if not (title_el and price_el):
+        logger.warning("Link manual: no se pudo extraer título/precio por scraping")
+        return None
+
+    title = title_el.get_text(strip=True)
+    price = float(re.sub(r"[^\d]", "", price_el.get_text(strip=True)) or 0)
+    if price <= 0:
+        return None
+
+    orig_el = soup.select_one(".ui-pdp-price__original-value .andes-money-amount__fraction")
+    orig = float(re.sub(r"[^\d]", "", orig_el.get_text(strip=True)) or 0) if orig_el else 0
+    disc = round((1 - price / orig) * 100) if orig > price else 0
+
+    img = ""
+    og_img = soup.select_one("meta[property='og:image']")
+    if og_img:
+        img = og_img.get("content", "")
+
+    page_text = soup.get_text(" ", strip=True).lower()
+    free_shipping = "envío gratis" in page_text or "envio gratis" in page_text
+
+    logger.info(f"Link manual: datos vía scraping para {item_id}")
+    return {
+        "id":       item_id,
+        "title":    title[:80],
+        "price":    price,
+        "original": orig if orig > price else price,
+        "discount": disc,
+        "url":      make_affiliate_link(final_url),
+        "img":      img,
+        "free_shipping": free_shipping,
+    }
+
+async def handle_admin_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Detecta un link de ML/meli.la en un mensaje del admin y lo publica
+    directo en el canal, sin esperar al broadcast automático."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    text = update.message.text or ""
+    m = LINK_RE.search(text)
+    if not m:
+        return  # mensaje del admin sin link, no es para nosotros
+
+    url = m.group(0)
+    status_msg = await update.message.reply_text("🔗 Procesando link...")
+
+    deal = await resolve_and_fetch_item(url)
+    if deal is None:
+        await status_msg.edit_text(
+            "⚠️ No pude extraer los datos de ese link. Verifica que sea un "
+            "link de producto válido de Mercado Libre (no de categoría/búsqueda)."
+        )
+        return
+
+    ok = await _send_one(ctx.bot, CHANNEL_ID, deal)
+    if ok:
+        seen = load_json(SEEN_DEALS_FILE, [])
+        seen.append(deal["id"])
+        save_json(SEEN_DEALS_FILE, seen[-SEEN_MAX:])
+        await status_msg.edit_text(f"✅ Publicado en el canal: {deal['title']}")
+    else:
+        await status_msg.edit_text("⚠️ Se extrajeron los datos pero falló la publicación en el canal.")
+
 # ── Envío ──────────────────────────────────────────────────────────────────────
 async def _send_one(bot, chat_id: int, deal: dict) -> bool:
     text = format_deal(deal)
@@ -479,7 +607,6 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Historial reiniciado.")
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Solo admin: diagnóstico rápido de fuentes y estado."""
     if update.effective_user.id != ADMIN_ID:
         return
     await update.message.reply_text("🩺 Probando fuentes...")
@@ -488,19 +615,18 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     subs = load_json(CHAT_IDS_FILE, [])
     seen = load_json(SEEN_DEALS_FILE, [])
-    # [NUEVO v6.1] estado real del token (minutos restantes o error), no
-    # solo si la variable existe.
     token_state = ml_token_manager.status_summary()
     data_state  = "✅ /data (persistente)" if DATA_DIR != "." else "⚠️ efímero (montar volumen)"
     await update.message.reply_text(
-        f"<b>Estado JackRocko v6.1</b>\n\n"
+        f"<b>Estado JackRocko v6.2</b>\n\n"
         f"🔑 Token ML: {token_state}\n"
         f"📡 API: {len(api_deals)} ofertas\n"
         f"🕷 Scraper: {len(scraper_deals)} ofertas\n"
         f"👥 Suscriptores: {len(subs)}\n"
         f"🗂 Historial: {len(seen)}/{SEEN_MAX}\n"
         f"💾 Datos: {data_state}\n"
-        f"⏱ Broadcast: cada {BROADCAST_MIN} min",
+        f"⏱ Broadcast: cada {BROADCAST_MIN} min\n"
+        f"🔗 Link manual: envíame cualquier link de ML y lo publico",
         parse_mode=ParseMode.HTML,
     )
 
@@ -514,10 +640,13 @@ def main():
     app.add_handler(CommandHandler("ofertas", cmd_ofertas))
     app.add_handler(CommandHandler("reset",   cmd_reset))
     app.add_handler(CommandHandler("status",  cmd_status))
+    # [NUEVO v6.2] link manual: cualquier texto del admin que NO sea comando
+    # y contenga un link de ML/meli.la se procesa y publica.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_link))
 
     app.job_queue.run_repeating(broadcast, interval=BROADCAST_MIN * 60, first=15)
 
-    logger.info("🚀 JackRocko Bot v6.1 iniciado")
+    logger.info("🚀 JackRocko Bot v6.2 iniciado")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
