@@ -1,6 +1,13 @@
 """
-JackRocko Bot v6.4 — Ofertas de Mercado Libre → Telegram
+JackRocko Bot v6.5 — Ofertas de Mercado Libre → Telegram
 ========================================================
+Cambios respecto a v6.4:
+ [14] Fix crítico: el bot entraba en crash loop cuando el canal (del cual
+      es admin) publicaba algo — esas actualizaciones (channel_post) NO
+      traen effective_user, y los handlers de /reset, /status, /manual y
+      el link automático asumían que siempre había un usuario. Ahora
+      todos verifican que exista antes de comparar con ADMIN_ID.
+
 Cambios respecto a v6.2:
  [13] Comando /manual (admin): publica una oferta dando tú el precio
       original y el % de descuento — el bot calcula el precio final y
@@ -491,4 +498,299 @@ async def resolve_and_fetch_item(raw_url: str) -> dict | None:
     page_text = soup.get_text(" ", strip=True).lower()
     free_shipping = "envío gratis" in page_text or "envio gratis" in page_text
 
-    logger.info(f"Link ma
+    logger.info(f"Link manual: datos vía scraping/OG para {item_id}")
+    return {
+        "id":       item_id,
+        "title":    title[:80],
+        "price":    price,
+        "original": orig if orig > price else price,
+        "discount": disc,
+        "url":      make_affiliate_link(final_url),
+        "img":      img,
+        "free_shipping": free_shipping,
+    }
+
+async def handle_admin_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # [FIX] Las publicaciones del propio canal (channel_post) llegan sin
+    # effective_user — sin este chequeo, el bot truena en cada post del canal.
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        return
+    text = update.message.text or ""
+    m = LINK_RE.search(text)
+    if not m:
+        return
+
+    url = m.group(0)
+    status_msg = await update.message.reply_text("🔗 Procesando link...")
+
+    deal = await resolve_and_fetch_item(url)
+    if deal is None:
+        await status_msg.edit_text(
+            "⚠️ No pude sacar los datos automáticamente (ML está bloqueando "
+            "bastante seguido últimamente).\n\n"
+            "Usa /manual en su lugar:\n"
+            "<code>/manual link | título | precio original | % descuento</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    ok = await _send_one(ctx.bot, CHANNEL_ID, deal)
+    if ok:
+        seen = load_json(SEEN_DEALS_FILE, [])
+        seen.append(deal["id"])
+        save_json(SEEN_DEALS_FILE, seen[-SEEN_MAX:])
+        await status_msg.edit_text(f"✅ Publicado en el canal: {deal['title']}")
+    else:
+        await status_msg.edit_text("⚠️ Se extrajeron los datos pero falló la publicación en el canal.")
+
+# ── /manual: publicar dando precio original y precio final ─────────────────────
+MANUAL_USAGE = (
+    "<b>Formato de /manual</b>\n\n"
+    "<code>/manual link | título | precio original | precio final</code>\n\n"
+    "El bot calcula el % de descuento solo — no tienes que sacar cuentas.\n\n"
+    "Con foto (opcional, 5ta parte con la URL de una imagen):\n"
+    "<code>/manual link | título | precio original | precio final | url imagen</code>\n\n"
+    "Ejemplo:\n"
+    "<code>/manual https://meli.la/1rCYTAu | Giorgio Armani Stronger with You "
+    "Intensely EDP 100ml | 3899 | 1789</code>\n\n"
+    "(También acepta % si prefieres escribirlo así: pon el número seguido de "
+    "<code>%</code> en la 4ta parte, ej. <code>54%</code>)"
+)
+
+async def cmd_manual(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        return
+    text = update.message.text or ""
+    payload = text.split(None, 1)
+    if len(payload) < 2 or not payload[1].strip():
+        await update.message.reply_text(MANUAL_USAGE, parse_mode=ParseMode.HTML)
+        return
+
+    parts = [p.strip() for p in payload[1].split("|")]
+    if len(parts) not in (4, 5):
+        await update.message.reply_text(
+            "⚠️ Necesito 4 o 5 partes separadas por <code>|</code>.\n\n" + MANUAL_USAGE,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    link, title, orig_str, fourth = parts[:4]
+    img_url = parts[4] if len(parts) == 5 else ""
+
+    if not LINK_RE.match(link):
+        await update.message.reply_text("⚠️ La primera parte debe ser un link válido de Mercado Libre.")
+        return
+    if not title:
+        await update.message.reply_text("⚠️ Falta el título del producto.")
+        return
+
+    try:
+        original = float(re.sub(r"[^\d.]", "", orig_str))
+    except ValueError:
+        await update.message.reply_text("⚠️ El precio original no es un número válido.")
+        return
+    if original <= 0:
+        await update.message.reply_text("⚠️ El precio original debe ser mayor a 0.")
+        return
+
+    # [NUEVO v6.4] la 4ta parte puede ser el % (si trae "%") o directamente
+    # el precio final (número plano) — en ese caso el % se calcula solo,
+    # y el precio queda exacto sin redondeos raros.
+    fourth_clean = fourth.strip()
+    try:
+        if "%" in fourth_clean:
+            discount = float(re.sub(r"[^\d.]", "", fourth_clean))
+            if not (0 < discount < 100):
+                await update.message.reply_text("⚠️ El % de descuento debe estar entre 1 y 99.")
+                return
+            final_price = round(original * (1 - discount / 100), 2)
+        else:
+            final_price = float(re.sub(r"[^\d.]", "", fourth_clean))
+            if final_price <= 0 or final_price >= original:
+                await update.message.reply_text(
+                    "⚠️ El precio final debe ser mayor a 0 y menor al precio original."
+                )
+                return
+            discount = round((original - final_price) / original * 100)
+    except ValueError:
+        await update.message.reply_text("⚠️ La 4ta parte (precio final o %) no es un número válido.")
+        return
+
+    deal = {
+        "id":       f"MANUAL{int(time.time())}",
+        "title":    title[:80],
+        "price":    final_price,
+        "original": original,
+        "discount": round(discount),
+        "url":      make_affiliate_link(link),
+        "img":      img_url,
+        "free_shipping": False,
+    }
+
+    ok = await _send_one(ctx.bot, CHANNEL_ID, deal)
+    if ok:
+        seen = load_json(SEEN_DEALS_FILE, [])
+        seen.append(deal["id"])
+        save_json(SEEN_DEALS_FILE, seen[-SEEN_MAX:])
+        await update.message.reply_text(
+            f"✅ Publicado en el canal:\n"
+            f"<b>{html.escape(title)}</b>\n"
+            f"${original:,.0f} → <b>${final_price:,.0f}</b> ({round(discount)}% OFF)",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text("⚠️ Falló la publicación en el canal.")
+
+# ── Envío ──────────────────────────────────────────────────────────────────────
+async def _send_one(bot, chat_id: int, deal: dict) -> bool:
+    text = format_deal(deal)
+    try:
+        if deal.get("img", "").startswith("http"):
+            try:
+                await bot.send_photo(chat_id, deal["img"], caption=text, parse_mode=ParseMode.HTML)
+                return True
+            except TelegramError:
+                pass
+        await bot.send_message(
+            chat_id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=False
+        )
+        return True
+    except TelegramError as e:
+        logger.warning(f"No se pudo enviar {deal['id']} a {chat_id}: {e}")
+        return False
+
+async def broadcast(context: ContextTypes.DEFAULT_TYPE):
+    bot = context.bot
+    deals = await get_all_deals()
+    if not deals:
+        logger.warning("⚠️ Sin ofertas en esta ronda.")
+        return
+
+    seen = load_json(SEEN_DEALS_FILE, [])
+    seen_set = set(seen)
+    new = [d for d in deals if d["id"] not in seen_set]
+    if not new:
+        logger.info("Sin ofertas nuevas (todas ya enviadas).")
+        return
+
+    channel_batch = new[:8]
+    subs_batch    = new[:3]
+
+    sent_ids = set()
+    if CHANNEL_ID:
+        for d in channel_batch:
+            if await _send_one(bot, CHANNEL_ID, d):
+                sent_ids.add(d["id"])
+            await asyncio.sleep(1.5)
+
+    for cid in load_json(CHAT_IDS_FILE, []):
+        for d in subs_batch:
+            if await _send_one(bot, cid, d):
+                sent_ids.add(d["id"])
+            await asyncio.sleep(1.5)
+
+    if sent_ids:
+        seen.extend(sent_ids)
+        save_json(SEEN_DEALS_FILE, seen[-SEEN_MAX:])
+        logger.info(f"✅ Broadcast: {len(sent_ids)} ofertas nuevas publicadas.")
+
+# ── Comandos ───────────────────────────────────────────────────────────────────
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    ids = load_json(CHAT_IDS_FILE, [])
+    if cid not in ids:
+        ids.append(cid)
+        save_json(CHAT_IDS_FILE, ids)
+    await update.message.reply_text(
+        "👋 ¡Hola! Soy JackRocko Bot.\n"
+        "Te mando las mejores ofertas de Mercado Libre automáticamente.\n"
+        "Usa /ofertas para buscar ahora mismo."
+    )
+
+async def cmd_ofertas(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    now = time.monotonic()
+    if now - _last_ofertas.get(cid, 0) < OFERTAS_COOLDOWN and cid != ADMIN_ID:
+        await update.message.reply_text("⏳ Espera un momento antes de buscar de nuevo.")
+        return
+    _last_ofertas[cid] = now
+
+    await update.message.reply_text("🔍 Buscando ofertas en vivo...")
+    deals = await get_all_deals()
+    if not deals:
+        await update.message.reply_text(
+            "⚠️ No encontré ofertas. Las fuentes pueden estar caídas — "
+            "el admin puede revisar con /status."
+        )
+        return
+
+    seen = load_json(SEEN_DEALS_FILE, [])
+    seen_set = set(seen)
+    new = [d for d in deals if d["id"] not in seen_set]
+    if not new:
+        await update.message.reply_text(
+            f"✅ Encontré {len(deals)} ofertas pero ya las viste todas.\n"
+            "El admin puede usar /reset para reiniciar el historial."
+        )
+        return
+
+    sent_ids = []
+    for d in new[:5]:
+        if await _send_one(ctx.bot, cid, d):
+            sent_ids.append(d["id"])
+        await asyncio.sleep(1.2)
+    if sent_ids:
+        seen.extend(sent_ids)
+        save_json(SEEN_DEALS_FILE, seen[-SEEN_MAX:])
+
+async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        return
+    save_json(SEEN_DEALS_FILE, [])
+    await update.message.reply_text("✅ Historial reiniciado.")
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        return
+    await update.message.reply_text("🩺 Probando fuentes...")
+    api_deals, scraper_deals = await asyncio.gather(
+        fetch_api_deals(), fetch_scraper_deals()
+    )
+    subs = load_json(CHAT_IDS_FILE, [])
+    seen = load_json(SEEN_DEALS_FILE, [])
+    token_state = ml_token_manager.status_summary()
+    data_state  = "✅ /data (persistente)" if DATA_DIR != "." else "⚠️ efímero (montar volumen)"
+    await update.message.reply_text(
+        f"<b>Estado JackRocko v6.5</b>\n\n"
+        f"🔑 Token ML: {token_state}\n"
+        f"📡 API: {len(api_deals)} ofertas\n"
+        f"🕷 Scraper: {len(scraper_deals)} ofertas\n"
+        f"👥 Suscriptores: {len(subs)}\n"
+        f"🗂 Historial: {len(seen)}/{SEEN_MAX}\n"
+        f"💾 Datos: {data_state}\n"
+        f"⏱ Broadcast: cada {BROADCAST_MIN} min\n"
+        f"🔗 Link automático: envíame un link de ML (best-effort)\n"
+        f"✍️ /manual: publica con precio y descuento a mano (más confiable)",
+        parse_mode=ParseMode.HTML,
+    )
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+def main():
+    if not BOT_TOKEN:
+        raise SystemExit("❌ Falta BOT_TOKEN en variables de entorno.")
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("ofertas", cmd_ofertas))
+    app.add_handler(CommandHandler("reset",   cmd_reset))
+    app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("manual",  cmd_manual))  # [NUEVO v6.4]
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_link))
+
+    app.job_queue.run_repeating(broadcast, interval=BROADCAST_MIN * 60, first=15)
+
+    logger.info("🚀 JackRocko Bot v6.5 iniciado")
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
